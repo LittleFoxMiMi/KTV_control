@@ -322,8 +322,31 @@ def music_search_local(keyword: str):
     keyword = (keyword or '').strip()
     if not keyword:
         raise HTTPException(status_code=400, detail='keyword is required')
-    music_items = db.search_music_library(keyword)
-    mv_items = db.search_mv_library(keyword)
+    music_items_raw = db.search_music_library(keyword)
+    mv_items_raw = db.search_mv_library(keyword)
+
+    music_items = []
+    for item in music_items_raw:
+        file_path = item.get('file_path')
+        if file_path and os.path.exists(_to_full_media_path(file_path)):
+            music_items.append(item)
+        else:
+            item_id = item.get('id')
+            if item_id:
+                db.delete_music_library_item(int(item_id))
+
+    mv_items = []
+    for item in mv_items_raw:
+        video_path = item.get('video_path')
+        audio_path = item.get('audio_path')
+        has_video = bool(video_path) and os.path.exists(_to_full_media_path(video_path))
+        has_audio = bool(audio_path) and os.path.exists(_to_full_media_path(audio_path))
+        if has_video and has_audio:
+            mv_items.append(item)
+        else:
+            video_id = item.get('video_id')
+            if video_id:
+                db.delete_mv_library_song(str(video_id))
 
     merged_records = [_build_music_public_record(item, from_library=True) for item in music_items]
     for rec in merged_records:
@@ -461,6 +484,7 @@ def music_queue_from_library(req: MusicLibraryQueueRequest):
 
     required_path = item.get('file_path')
     if not required_path or not os.path.exists(_to_full_media_path(required_path)):
+        db.delete_music_library_item(req.library_id)
         raise HTTPException(status_code=404, detail='no file')
 
     pseudo_url = f"musiclib://{req.library_id}/{int(time.time() * 1000)}"
@@ -504,6 +528,7 @@ def music_queue_from_mv_library(req: MVLibraryQueueRequest):
     required_audio = item.get('audio_path')
     if (not required_video or not os.path.exists(_to_full_media_path(required_video))
             or not required_audio or not os.path.exists(_to_full_media_path(required_audio))):
+        db.delete_mv_library_song(video_id)
         raise HTTPException(status_code=404, detail='no file')
 
     pseudo_url = f"mvlib://{video_id}/{int(time.time() * 1000)}"

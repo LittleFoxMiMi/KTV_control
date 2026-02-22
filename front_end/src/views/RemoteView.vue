@@ -1,5 +1,5 @@
 <template>
-  <div class="remote-view">
+  <div :class="['remote-view', { 'queue-active': activeTab === 'queue' }]">
     <div v-show="activeTab === 'remote'" class="header">
       <h1>📱 KTV Remote</h1>
       <div class="connection-status" :class="{ connected: isConnected }"></div>
@@ -138,10 +138,10 @@
       </div>
     </div>
 
-    <div v-show="activeTab === 'queue'" class="tab-page">
-      <div class="card queue">
-        <h3>Queue</h3>
-        <div v-if="songs.length > 0" class="now-processing">
+    <div v-show="activeTab === 'queue'" class="tab-page queue-page">
+      <h3 class="queue-title">Queue</h3>
+      <div v-if="songs.length > 0" class="card now-processing-card">
+        <div class="now-processing">
           <h4 v-if="songs[0].status === 'completed'">🎵 Now Playing: {{ songs[0].title || 'Unknown' }}</h4>
           <h4 v-else>⚙️ Processing: {{ songs[0].title || 'Unknown' }}</h4>
 
@@ -150,24 +150,24 @@
           </div>
           <p>{{ songs[0].status_detail || songs[0].status }}</p>
         </div>
+      </div>
 
-        <div class="queue-list">
-          <div v-for="(song, index) in reversedQueue" :key="song.id" class="queue-item" :data-id="song.id">
-            <div class="info">
-              <div class="title" :class="{ 'is-overflow': overflowMap[song.id]?.overflow }">
-                <span class="title-text" :style="overflowMap[song.id]?.overflow ? { '--marquee-distance': `-${overflowMap[song.id].distance}px` } : {}">
-                  {{ song.title || song.url }}
-                </span>
-              </div>
-              <div class="status">
-                {{ song.status }}
-                <span v-if="song.status !== 'completed' && song.progress > 0">{{ Math.round(song.progress) }}%</span>
-              </div>
+      <div class="queue-list">
+        <div v-for="(song, index) in reversedQueue" :key="song.id" class="queue-item" :data-id="song.id">
+          <div class="info">
+            <div class="title" :class="{ 'is-overflow': overflowMap[song.id]?.overflow }">
+              <span class="title-text" :style="overflowMap[song.id]?.overflow ? { '--marquee-distance': `-${overflowMap[song.id].distance}px` } : {}">
+                {{ song.title || song.url }}
+              </span>
             </div>
-            <div class="actions">
-              <button class="btn-move" :disabled="index === 0" @click="moveSong(song.id, 'top')">置顶</button>
-              <button class="btn-del" @click="deleteSong(song.id)">✕</button>
+            <div class="status">
+              {{ song.status }}
+              <span v-if="song.status !== 'completed' && song.progress > 0">{{ Math.round(song.progress) }}%</span>
             </div>
+          </div>
+          <div class="actions">
+            <button class="btn-move" :disabled="index === 0" @click="moveSong(song.id, 'top')">置顶</button>
+            <button class="btn-del" @click="deleteSong(song.id)">✕</button>
           </div>
         </div>
       </div>
@@ -769,16 +769,49 @@ onUnmounted(() => {
 .search-action:hover { background: #252525; }
 .search-hint { color: #c7b58a; }
 
-.queue-list .queue-item { display: flex; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid #333; }
+.queue-page {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.queue-title {
+  margin: 0 0 8px 0;
+  flex: 0 0 auto;
+}
+.now-processing-card {
+  flex: 0 0 auto;
+}
+.queue-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: 6px;
+}
+.queue-list .queue-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid #333;
+}
+.queue-list .info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
 .queue-list .actions {
   display: flex;
   flex-direction: row;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
   flex-wrap: nowrap;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
-.queue-list .title { max-width: 300px; overflow: hidden; white-space: nowrap; }
+.queue-list .title { max-width: 100%; overflow: hidden; white-space: nowrap; }
 .queue-list .title-text { display: inline-block; transform: translateX(0); }
 .queue-list .title.is-overflow .title-text { animation: queue-marquee 12s linear infinite; }
 @keyframes queue-marquee {
@@ -794,7 +827,14 @@ onUnmounted(() => {
 
 .status-bar { width: 100%; height: 6px; background: #333; border-radius: 999px; overflow: hidden; margin: 6px 0; }
 .fill { height: 100%; background: #4f8bff; }
-.btn-move, .btn-del { border: none; border-radius: 6px; padding: 8px 12px; color: #fff; }
+.btn-move, .btn-del {
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.2;
+}
 .btn-move { background: #4463a8; }
 .btn-del { background: #963d3d; }
 
@@ -817,4 +857,11 @@ onUnmounted(() => {
   font-size: 15px;
 }
 .bottom-tabs button.active { color: #fff; background: #262626; }
+
+.remote-view.queue-active {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
 </style>

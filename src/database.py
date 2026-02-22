@@ -644,6 +644,20 @@ class SongDatabase:
         conn.commit()
         conn.close()
 
+    def delete_music_library_item(self, item_id: int):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM music_library WHERE id = ?", (item_id,))
+        conn.commit()
+        conn.close()
+
+    def delete_mv_library_song(self, video_id: str):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM library WHERE video_id = ?", (video_id,))
+        conn.commit()
+        conn.close()
+
     def get_song(self, song_id: int) -> Optional[Dict[str, Any]]:
         conn = self._get_conn()
         cursor = conn.cursor()
