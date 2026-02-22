@@ -23,16 +23,18 @@ class MusicDLService:
         self.legacy_musicdl_outputs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'musicdl_outputs'))
         touchdir(self.musicdl_cache_dir)
         self.default_sources = music_sources or [
+            'JBSouMusicClient',
             'QQMusicClient',
             'KuwoMusicClient',
             'KugouMusicClient',
             'NeteaseMusicClient',
         ]
         self.init_music_clients_cfg = {
-            'QQMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
-            'NeteaseMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
-            'KuwoMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
-            'KugouMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
+            'JBSouMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'QQMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'NeteaseMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'KuwoMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'KugouMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
         }
         self.requests_overrides = {
             'QQMusicClient': {'cookies': {'quality_policy': 'mp3_only'}},
@@ -169,6 +171,7 @@ class MusicDLService:
             return records
 
         source_priority = {
+            'JBSouMusicClient': 0,
             'QQMusicClient': 0,
             'NeteaseMusicClient': 1,
             'KuwoMusicClient': 2,
@@ -533,16 +536,106 @@ class MusicDLService:
         finally:
             self._cleanup_musicdl_output_dirs()
 
+    def download_music_record(
+        self,
+        song_record: Dict,
+        save_dir: str,
+        cookies_file: Optional[str] = None,
+        download_cover: bool = True,
+        download_lyric: bool = True,
+    ) -> Dict:
+        try:
+            if not isinstance(song_record, dict):
+                raise ValueError('song_record must be dict')
+
+            download_url = song_record.get('download_url')
+            if not download_url:
+                raise ValueError('song record has no download url')
+
+            source = song_record.get('source', '')
+            headers = {}
+            if self.music_client and source in getattr(self.music_client, 'music_clients', {}):
+                try:
+                    headers = self.music_client.music_clients[source].default_download_headers
+                except Exception:
+                    headers = {}
+
+            session = requests.Session()
+            if cookies_file:
+                session.cookies.update(self._load_cookies_from_file(cookies_file))
+
+            touchdir(save_dir)
+            song_name = song_record.get('song_name') or 'song'
+            ext = song_record.get('ext') or 'mp3'
+            file_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.{ext}'))
+            warnings: List[str] = []
+
+            self._download_binary_file(session, download_url, file_path, headers=headers)
+
+            cover_path = None
+            cover_url = self._resolve_cover_url(song_record)
+            if download_cover and cover_url.startswith('http'):
+                cover_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.jpg'))
+                try:
+                    self._download_binary_file(session, cover_url, cover_path, headers=headers)
+                except Exception:
+                    cover_path = None
+                    warnings.append('cover download failed')
+
+            lyric_path = None
+            lyric_value = song_record.get('lyric')
+            if download_lyric and lyric_value:
+                lyric_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.lrc'))
+                try:
+                    lyric_text = ''
+                    if isinstance(lyric_value, str) and lyric_value.startswith('http'):
+                        with session.get(lyric_value, headers=headers, timeout=30, verify=False) as resp:
+                            resp.raise_for_status()
+                            lyric_text = resp.text
+                    else:
+                        lyric_text = str(lyric_value)
+                    with open(lyric_path, 'w', encoding='utf-8') as fp:
+                        fp.write(lyric_text)
+                except Exception:
+                    lyric_path = None
+                    warnings.append('lyric download failed')
+
+            return {
+                'song_name': song_name,
+                'singers': song_record.get('singers', ''),
+                'album': song_record.get('album', ''),
+                'source': source,
+                'file_path': file_path,
+                'ext': ext,
+                'file_size': song_record.get('file_size', ''),
+                'cover_path': cover_path,
+                'lyric_path': lyric_path,
+                'warnings': warnings,
+                'status': 'success',
+            }
+        finally:
+            self._cleanup_musicdl_output_dirs()
+
 
 if __name__ == '__main__':
     service = MusicDLService()
 
+    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
     source_cookie_file_map = {
         'QQMusicClient': 'QQ.txt',
         'NeteaseMusicClient': '163.txt',
         'KuwoMusicClient': '',
         'KugouMusicClient': '',
     }
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as fp:
+                cfg = json.load(fp)
+            from_cfg = ((cfg.get('music') or {}).get('cookie_file_map') or {})
+            if isinstance(from_cfg, dict) and from_cfg:
+                source_cookie_file_map = {str(k): str(v) for k, v in from_cfg.items()}
+        except Exception:
+            pass
 
     test_keyword = '春雪'
     print(f'[TEST] search keyword: {test_keyword}')

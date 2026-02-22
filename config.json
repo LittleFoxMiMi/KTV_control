@@ -17,5 +17,13 @@
     "system": {
         "port": 8000,
         "host": "0.0.0.0"
+    },
+    "music": {
+        "cookie_file_map": {
+            "QQMusicClient": "QQ.txt",
+            "NeteaseMusicClient": "163.txt",
+            "KuwoMusicClient": "kuwo.txt",
+            "KugouMusicClient": ""
+        }
     }
 }

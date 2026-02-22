@@ -20,6 +20,22 @@ class SongDatabase:
     def _init_db(self):
         conn = self._get_conn()
         cursor = conn.cursor()
+
+        def _ensure_column(table_name: str, column_name: str, column_def: str):
+            try:
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                existed_cols = {row['name'] for row in cursor.fetchall()}
+                if column_name in existed_cols:
+                    return
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+            except sqlite3.OperationalError as e:
+                err = str(e).lower()
+                if 'duplicate column name' in err:
+                    return
+                print(f"Migration {column_name} failed: {e}")
+            except Exception as e:
+                print(f"Migration {column_name} failed: {e}")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS songs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,7 +50,14 @@ class SongDatabase:
                 error_msg TEXT,
                 created_at REAL,
                 priority INTEGER DEFAULT 0,
-                video_id TEXT UNIQUE
+                video_id TEXT UNIQUE,
+                media_type TEXT DEFAULT 'video',
+                singers TEXT,
+                platform TEXT,
+                format TEXT,
+                size_text TEXT,
+                cover_path TEXT,
+                lyric_path TEXT
             )
         ''')
         
@@ -59,6 +82,20 @@ class SongDatabase:
             except Exception as e:
                 print(f"Migration video_id failed: {e}")
 
+        # Migration: music related columns
+        song_migrations = [
+            ("media_type", "TEXT DEFAULT 'video'"),
+            ("singers", "TEXT"),
+            ("platform", "TEXT"),
+            ("format", "TEXT"),
+            ("size_text", "TEXT"),
+            ("album", "TEXT"),
+            ("cover_path", "TEXT"),
+            ("lyric_path", "TEXT"),
+        ]
+        for col_name, col_def in song_migrations:
+            _ensure_column('songs', col_name, col_def)
+
         # Library Table for History/Cache
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS library (
@@ -80,9 +117,232 @@ class SongDatabase:
                 value TEXT
             )
         ''')
+
+        # Music Library Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS music_library (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                singers TEXT,
+                album TEXT,
+                platform TEXT,
+                format TEXT,
+                size_text TEXT,
+                file_path TEXT NOT NULL,
+                raw_audio_path TEXT,
+                cover_path TEXT,
+                lyric_path TEXT,
+                unique_key TEXT UNIQUE,
+                created_at REAL,
+                last_used_at REAL
+            )
+        ''')
+
+        # Music Search Jobs Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS music_search_jobs (
+                job_id TEXT PRIMARY KEY,
+                task_id TEXT,
+                mode TEXT,
+                keyword TEXT,
+                status TEXT,
+                message TEXT,
+                progress REAL DEFAULT 0,
+                total_sources INTEGER DEFAULT 0,
+                completed_sources INTEGER DEFAULT 0,
+                records_json TEXT,
+                full_records_json TEXT,
+                cancel_requested INTEGER DEFAULT 0,
+                created_at REAL,
+                updated_at REAL
+            )
+        ''')
+
+        _ensure_column('music_library', 'raw_audio_path', 'TEXT')
+        _ensure_column('music_library', 'album', 'TEXT')
+        _ensure_column('music_search_jobs', 'task_id', 'TEXT')
+        _ensure_column('music_search_jobs', 'progress', 'REAL DEFAULT 0')
+        _ensure_column('music_search_jobs', 'total_sources', 'INTEGER DEFAULT 0')
+        _ensure_column('music_search_jobs', 'completed_sources', 'INTEGER DEFAULT 0')
+        _ensure_column('music_search_jobs', 'records_json', 'TEXT')
+        _ensure_column('music_search_jobs', 'full_records_json', 'TEXT')
+        _ensure_column('music_search_jobs', 'cancel_requested', 'INTEGER DEFAULT 0')
+        _ensure_column('music_search_jobs', 'created_at', 'REAL')
+        _ensure_column('music_search_jobs', 'updated_at', 'REAL')
+
+        self._cleanup_music_search_jobs(cursor, max_age_seconds=24 * 3600, keep_latest=300)
             
         conn.commit()
         conn.close()
+
+    def _cleanup_music_search_jobs(self, cursor, max_age_seconds: int = 86400, keep_latest: int = 300):
+        now = time.time()
+        expire_before = now - max_age_seconds
+        try:
+            cursor.execute(
+                '''
+                DELETE FROM music_search_jobs
+                WHERE COALESCE(updated_at, created_at, 0) < ?
+                ''',
+                (expire_before,),
+            )
+        except Exception as e:
+            print(f"Cleanup music_search_jobs by age failed: {e}")
+
+        try:
+            cursor.execute("SELECT job_id FROM music_search_jobs ORDER BY COALESCE(updated_at, created_at, 0) DESC")
+            rows = cursor.fetchall()
+            if len(rows) > keep_latest:
+                stale_ids = [row['job_id'] for row in rows[keep_latest:]]
+                cursor.executemany("DELETE FROM music_search_jobs WHERE job_id = ?", [(job_id,) for job_id in stale_ids])
+        except Exception as e:
+            print(f"Cleanup music_search_jobs by count failed: {e}")
+
+    def cleanup_music_search_jobs(self, max_age_seconds: int = 86400, keep_latest: int = 300):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        self._cleanup_music_search_jobs(cursor, max_age_seconds=max_age_seconds, keep_latest=keep_latest)
+        conn.commit()
+        conn.close()
+
+    def create_music_search_job(self, job_id: str, mode: str, keyword: str, task_id: str = None) -> None:
+        now = time.time()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        self._cleanup_music_search_jobs(cursor, max_age_seconds=24 * 3600, keep_latest=300)
+        cursor.execute(
+            '''
+            INSERT OR REPLACE INTO music_search_jobs
+            (job_id, task_id, mode, keyword, status, message, progress, total_sources, completed_sources, records_json, full_records_json, cancel_requested, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'waiting', '排队中...', 0, 0, 0, '[]', '{}', 0, ?, ?)
+            ''',
+            (job_id, task_id, mode, keyword, now, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_music_search_job(self, job_id: str, **fields) -> bool:
+        if not fields:
+            return False
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        updates = []
+        params = []
+        for key, val in fields.items():
+            updates.append(f"{key} = ?")
+            params.append(val)
+        updates.append("updated_at = ?")
+        params.append(time.time())
+        params.append(job_id)
+        cursor.execute(f"UPDATE music_search_jobs SET {', '.join(updates)} WHERE job_id = ?", params)
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+        return changed
+
+    def set_music_search_task_id(self, job_id: str, task_id: str) -> bool:
+        return self.update_music_search_job(job_id, task_id=task_id)
+
+    def request_cancel_music_search_job(self, job_id: str) -> bool:
+        return self.update_music_search_job(job_id, cancel_requested=1, status='cancelled', message='已取消')
+
+    def is_music_search_cancel_requested(self, job_id: str) -> bool:
+        item = self.get_music_search_job(job_id)
+        if not item:
+            return True
+        return bool(item.get('cancel_requested'))
+
+    def get_music_search_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM music_search_jobs WHERE job_id = ?", (job_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        item = dict(row)
+        item['cancel_requested'] = bool(item.get('cancel_requested'))
+        return item
+
+    def find_stale_music_search_jobs(self, waiting_seconds: int = 20, running_seconds: int = 1800) -> List[Dict[str, Any]]:
+        now = time.time()
+        waiting_before = now - max(1, int(waiting_seconds))
+        running_before = now - max(1, int(running_seconds))
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT * FROM music_search_jobs
+            WHERE
+                (status = 'waiting' AND COALESCE(updated_at, created_at, 0) < ?)
+                OR
+                (status = 'running' AND COALESCE(updated_at, created_at, 0) < ?)
+            ORDER BY COALESCE(updated_at, created_at, 0) ASC
+            ''',
+            (waiting_before, running_before),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def mark_music_search_jobs_cancelled(self, job_ids: List[str], message: str = 'stale-cancelled'):
+        if not job_ids:
+            return
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        now = time.time()
+        cursor.executemany(
+            '''
+            UPDATE music_search_jobs
+            SET cancel_requested = 1,
+                status = 'cancelled',
+                message = ?,
+                updated_at = ?
+            WHERE job_id = ?
+            ''',
+            [(message, now, str(job_id)) for job_id in job_ids],
+        )
+        conn.commit()
+        conn.close()
+
+    def count_active_music_search_jobs(self) -> int:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT COUNT(*) AS cnt
+            FROM music_search_jobs
+            WHERE cancel_requested = 0
+              AND status IN ('waiting', 'running')
+            ''',
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return int((row['cnt'] if row and 'cnt' in row.keys() else 0) or 0)
+
+    def get_music_search_job_ahead(self, job_id: str) -> int:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(created_at, 0) AS created_at FROM music_search_jobs WHERE job_id = ?", (job_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return 0
+        created_at = float(row['created_at'] or 0)
+        cursor.execute(
+            '''
+            SELECT COUNT(*) AS cnt
+            FROM music_search_jobs
+            WHERE cancel_requested = 0
+              AND status IN ('waiting', 'running')
+              AND job_id != ?
+              AND COALESCE(created_at, 0) < ?
+            ''',
+            (job_id, created_at),
+        )
+        count_row = cursor.fetchone()
+        conn.close()
+        return int((count_row['cnt'] if count_row and 'cnt' in count_row.keys() else 0) or 0)
 
     def get_library_song(self, video_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_conn()
@@ -233,6 +493,157 @@ class SongDatabase:
         finally:
             conn.close()
 
+    def update_song_media(
+        self,
+        song_id: int,
+        media_type: str = None,
+        singers: str = None,
+        album: str = None,
+        platform: str = None,
+        fmt: str = None,
+        size_text: str = None,
+        cover_path: str = None,
+        lyric_path: str = None,
+    ):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        updates = []
+        params = []
+        try:
+            if media_type is not None:
+                updates.append("media_type = ?")
+                params.append(media_type)
+            if singers is not None:
+                updates.append("singers = ?")
+                params.append(singers)
+            if album is not None:
+                updates.append("album = ?")
+                params.append(album)
+            if platform is not None:
+                updates.append("platform = ?")
+                params.append(platform)
+            if fmt is not None:
+                updates.append("format = ?")
+                params.append(fmt)
+            if size_text is not None:
+                updates.append("size_text = ?")
+                params.append(size_text)
+            if cover_path is not None:
+                updates.append("cover_path = ?")
+                params.append(cover_path)
+            if lyric_path is not None:
+                updates.append("lyric_path = ?")
+                params.append(lyric_path)
+            if not updates:
+                return
+            params.append(song_id)
+            cursor.execute(f"UPDATE songs SET {', '.join(updates)} WHERE id = ?", params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def search_music_library(self, keyword: str, limit: int = 30) -> List[Dict[str, Any]]:
+        kw = str(keyword or '').strip()
+        if not kw:
+            return []
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        like = f"%{kw}%"
+        cursor.execute(
+            '''
+            SELECT * FROM music_library
+            WHERE title LIKE ? OR singers LIKE ? OR album LIKE ?
+            ORDER BY last_used_at DESC, created_at DESC
+            LIMIT ?
+            ''',
+            (like, like, like, limit),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def search_mv_library(self, keyword: str, limit: int = 30) -> List[Dict[str, Any]]:
+        kw = str(keyword or '').strip()
+        if not kw:
+            return []
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        like = f"%{kw}%"
+        cursor.execute(
+            '''
+            SELECT * FROM library
+            WHERE title LIKE ? OR video_id LIKE ? OR platform LIKE ?
+            ORDER BY last_used_at DESC, created_at DESC
+            LIMIT ?
+            ''',
+            (like, like, like, limit),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_music_library_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM music_library WHERE id = ?", (item_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def save_music_library_item(
+        self,
+        title: str,
+        singers: str,
+        album: str,
+        platform: str,
+        fmt: str,
+        size_text: str,
+        file_path: str,
+        raw_audio_path: str,
+        cover_path: str,
+        lyric_path: str,
+        unique_key: str,
+    ) -> Optional[int]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        now = time.time()
+        try:
+            cursor.execute(
+                '''
+                INSERT INTO music_library (title, singers, album, platform, format, size_text, file_path, raw_audio_path, cover_path, lyric_path, unique_key, created_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(unique_key) DO UPDATE SET
+                    title=excluded.title,
+                    singers=excluded.singers,
+                    album=excluded.album,
+                    platform=excluded.platform,
+                    format=excluded.format,
+                    size_text=excluded.size_text,
+                    file_path=excluded.file_path,
+                    raw_audio_path=excluded.raw_audio_path,
+                    cover_path=excluded.cover_path,
+                    lyric_path=excluded.lyric_path,
+                    last_used_at=excluded.last_used_at
+                ''',
+                (title, singers, album, platform, fmt, size_text, file_path, raw_audio_path, cover_path, lyric_path, unique_key, now, now),
+            )
+            conn.commit()
+            cursor.execute("SELECT id FROM music_library WHERE unique_key = ?", (unique_key,))
+            row = cursor.fetchone()
+            return int(row['id']) if row else None
+        except Exception as e:
+            print(f"Music Library Save Error: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def touch_music_library_item(self, item_id: int):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE music_library SET last_used_at = ? WHERE id = ?", (time.time(), item_id))
+        conn.commit()
+        conn.close()
+
     def get_song(self, song_id: int) -> Optional[Dict[str, Any]]:
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -332,15 +743,16 @@ class SongDatabase:
     def delete_song(self, song_id: int):
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT video_path, audio_path FROM songs WHERE id=?", (song_id,))
+        cursor.execute("SELECT video_path, audio_path, cover_path, lyric_path FROM songs WHERE id=?", (song_id,))
         row = cursor.fetchone()
         if row:
-            if row['video_path'] and os.path.exists(row['video_path']):
-                try: os.remove(row['video_path'])
-                except: pass
-            if row['audio_path'] and os.path.exists(row['audio_path']):
-                try: os.remove(row['audio_path'])
-                except: pass
+            for key in ['video_path', 'audio_path', 'cover_path', 'lyric_path']:
+                path = row[key]
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
         
         cursor.execute("DELETE FROM songs WHERE id = ?", (song_id,))
         conn.commit()

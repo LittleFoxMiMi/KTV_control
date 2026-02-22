@@ -6,12 +6,21 @@ import json
 import os
 import uvicorn
 import re
-import subprocess
 import time
+import uuid
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import List
+from typing import List, Dict, Any
 
-from src.tasks import huey, process_song_task, db
+from src.tasks import (
+    huey,
+    process_song_task,
+    process_music_search_jb_task,
+    process_music_search_normal_task,
+    process_music_search_qq_task,
+    process_music_download_task,
+    db,
+)
+from src.music_dl import MusicDLService
 
 # Load Config
 CONFIG_PATH = "config.json"
@@ -22,6 +31,42 @@ else:
     config = {}
 
 app = FastAPI(title="KTV Control System")
+
+music_service = MusicDLService()
+DEBUG_LOG_DIR = os.path.join('Temp', 'logs')
+DEBUG_MUSIC_DOWNLOAD_LOG = os.path.join(DEBUG_LOG_DIR, 'music_download.log')
+
+
+def _task_to_debug_dict(task_obj):
+    if task_obj is None:
+        return {}
+    return {
+        'id': getattr(task_obj, 'id', None),
+        'name': getattr(task_obj, 'name', None),
+        'args': list(getattr(task_obj, 'args', []) or []),
+        'kwargs': dict(getattr(task_obj, 'kwargs', {}) or {}),
+        'eta': str(getattr(task_obj, 'eta', '')),
+        'priority': getattr(task_obj, 'priority', None),
+        'repr': repr(task_obj),
+    }
+
+
+def _huey_snapshot(limit: int = 50):
+    pending = huey.pending(limit=limit)
+    scheduled = huey.scheduled(limit=limit)
+    snapshot = {
+        'pending_count': huey.pending_count(),
+        'scheduled_count': huey.scheduled_count(),
+        'result_count': huey.result_count(),
+        'pending': [_task_to_debug_dict(x) for x in pending],
+        'scheduled': [_task_to_debug_dict(x) for x in scheduled],
+    }
+    print(f"[HUEY DEBUG] pending={snapshot['pending_count']} scheduled={snapshot['scheduled_count']} result={snapshot['result_count']}")
+    for item in snapshot['pending']:
+        print(f"[HUEY DEBUG][PENDING] id={item.get('id')} name={item.get('name')} args={item.get('args')}")
+    for item in snapshot['scheduled']:
+        print(f"[HUEY DEBUG][SCHEDULED] id={item.get('id')} name={item.get('name')} eta={item.get('eta')}")
+    return snapshot
 
 # WebSocket Manager
 class ConnectionManager:
@@ -77,6 +122,111 @@ app.mount("/songs", StaticFiles(directory=songs_dir), name="songs")
 
 class SongRequest(BaseModel):
     url: str
+
+
+class MusicSearchStartRequest(BaseModel):
+    keyword: str
+    mode: str = 'normal'  # normal | qq
+
+
+class MusicSearchQueueRequest(BaseModel):
+    job_id: str
+    result_id: int
+
+
+class MusicLibraryQueueRequest(BaseModel):
+    library_id: int
+
+
+class MVLibraryQueueRequest(BaseModel):
+    video_id: str
+
+
+def _normalize_rel_path(path_value: str) -> str:
+    if not path_value:
+        return ''
+    return str(path_value).replace('\\', '/')
+
+
+def _to_full_media_path(path_value: str) -> str:
+    if not path_value:
+        return ''
+    path_text = str(path_value)
+    if os.path.isabs(path_text):
+        return path_text
+    return os.path.join(songs_dir, path_text)
+
+
+def _song_missing_required_files(song: Dict[str, Any]) -> bool:
+    media_type = song.get('media_type') or 'video'
+    required_keys = ['audio_path'] if media_type == 'music' else ['video_path', 'audio_path']
+    for key in required_keys:
+        rel_path = song.get(key)
+        if not rel_path:
+            return True
+        full_path = _to_full_media_path(rel_path)
+        if not os.path.exists(full_path):
+            return True
+    return False
+
+
+def _music_source_to_platform(source: str) -> str:
+    mapping = {
+        'JBSouMusicClient': 'jbsou',
+        'QQMusicClient': 'qq',
+        'NeteaseMusicClient': 'netease',
+        'KuwoMusicClient': 'kuwo',
+        'KugouMusicClient': 'kugou',
+    }
+    return mapping.get(source, source or 'music')
+
+
+def _make_music_save_dir(source: str, song_name: str, singers: str) -> str:
+    safe_source = _music_source_to_platform(source)
+    folder_name = re.sub(r'[\\/:*?"<>|]+', '_', f"{song_name or 'song'} - {singers or 'unknown'}").strip() or 'song'
+    save_dir = os.path.join(songs_dir, 'music', safe_source, folder_name)
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
+
+def _build_music_public_record(item: Dict[str, Any], from_library: bool = False) -> Dict[str, Any]:
+    return {
+        'id': item.get('id', -1),
+        'song_name': item.get('song_name') or item.get('title') or '',
+        'singers': item.get('singers', ''),
+        'album': item.get('album', ''),
+        'source': item.get('source') or item.get('platform') or '',
+        'ext': item.get('ext') or item.get('format') or '',
+        'file_size': item.get('file_size') or item.get('size_text') or '',
+        'from_library': from_library,
+        'library_id': item.get('id') if from_library else None,
+    }
+
+
+def _build_mv_library_public_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': -1,
+        'song_name': item.get('title') or '',
+        'singers': '',
+        'album': '',
+        'source': item.get('platform') or 'mv',
+        'ext': 'video',
+        'file_size': '',
+        'from_library': True,
+        'library_id': None,
+        'library_type': 'mv',
+        'video_id': item.get('video_id') or '',
+    }
+
+
+def _parse_json_safe(raw_text: str, fallback):
+    try:
+        if raw_text is None:
+            return fallback
+        return json.loads(raw_text)
+    except Exception:
+        return fallback
+
 
 @app.websocket("/ws/{client_type}")
 async def websocket_endpoint(websocket: WebSocket, client_type: str):
@@ -166,29 +316,300 @@ def add_song(request: SongRequest):
     process_song_task(song_id)
     return {"status": "queued", "id": song_id, "title": clean_url}
 
+
+@app.get('/music/search/local')
+def music_search_local(keyword: str):
+    keyword = (keyword or '').strip()
+    if not keyword:
+        raise HTTPException(status_code=400, detail='keyword is required')
+    music_items = db.search_music_library(keyword)
+    mv_items = db.search_mv_library(keyword)
+
+    merged_records = [_build_music_public_record(item, from_library=True) for item in music_items]
+    for rec in merged_records:
+        rec['library_type'] = 'music'
+    merged_records.extend([_build_mv_library_public_record(item) for item in mv_items])
+
+    return {
+        'keyword': keyword,
+        'records': merged_records,
+        'from_library_only': True,
+        'total': len(merged_records),
+    }
+
+
+@app.post('/music/search/start')
+def music_search_start(req: MusicSearchStartRequest):
+    keyword = (req.keyword or '').strip()
+    mode = (req.mode or 'normal').strip().lower()
+    if mode not in ('jb', 'normal', 'qq'):
+        raise HTTPException(status_code=400, detail='mode must be jb, normal or qq')
+    if not keyword:
+        raise HTTPException(status_code=400, detail='keyword is required')
+
+    stale_jobs = db.find_stale_music_search_jobs(waiting_seconds=20, running_seconds=1800)
+    if stale_jobs:
+        stale_ids = [str(item.get('job_id')) for item in stale_jobs if item.get('job_id')]
+        stale_task_ids = [str(item.get('task_id')) for item in stale_jobs if item.get('task_id')]
+        for task_id in stale_task_ids:
+            try:
+                huey.revoke_by_id(task_id)
+            except Exception:
+                pass
+        db.mark_music_search_jobs_cancelled(stale_ids, message='自动清理旧排队任务')
+
+    ahead = db.count_active_music_search_jobs()
+
+    job_id = str(uuid.uuid4())
+    db.create_music_search_job(job_id=job_id, mode=mode, keyword=keyword)
+    try:
+        if mode == 'jb':
+            task = process_music_search_jb_task(job_id, keyword)
+        elif mode == 'qq':
+            task = process_music_search_qq_task(job_id, keyword)
+        else:
+            task = process_music_search_normal_task(job_id, keyword)
+        task_id = getattr(task, 'id', None)
+        if task_id:
+            db.set_music_search_task_id(job_id, task_id)
+        _huey_snapshot(limit=20)
+    except Exception as exc:
+        db.update_music_search_job(job_id, status='error', message=f'提交任务失败: {exc}')
+        raise HTTPException(status_code=500, detail='failed to enqueue search task')
+
+    return {'job_id': job_id, 'mode': mode, 'status': 'waiting', 'ahead': ahead}
+
+
+@app.get('/music/search/job/{job_id}')
+def music_search_job(job_id: str):
+    job = db.get_music_search_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='search job not found')
+    ahead = db.get_music_search_job_ahead(job_id)
+
+    return {
+        'job_id': job['job_id'],
+        'mode': job.get('mode') or 'normal',
+        'keyword': job.get('keyword') or '',
+        'status': job.get('status') or 'waiting',
+        'message': job.get('message') or '',
+        'ahead': ahead,
+        'progress': float(job.get('progress') or 0),
+        'total_sources': int(job.get('total_sources') or 0),
+        'completed_sources': int(job.get('completed_sources') or 0),
+        'records': _parse_json_safe(job.get('records_json'), []),
+    }
+
+
+@app.post('/music/search/job/{job_id}/cancel')
+def music_search_cancel(job_id: str):
+    job = db.get_music_search_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='search job not found')
+
+    db.update_music_search_job(job_id, cancel_requested=1, status='cancelled', message='已取消')
+    task_id = job.get('task_id')
+    if task_id:
+        try:
+            huey.revoke_by_id(task_id)
+        except Exception:
+            pass
+    return {'status': 'cancelled'}
+
+
+@app.post('/music/queue/from_search')
+def music_queue_from_search(req: MusicSearchQueueRequest):
+    job = db.get_music_search_job(req.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='search job not found')
+    if (job.get('status') or '') != 'done':
+        raise HTTPException(status_code=400, detail='search job not completed')
+
+    full_records = _parse_json_safe(job.get('full_records_json'), {})
+    full_record = (full_records or {}).get(str(req.result_id))
+    if not full_record:
+        raise HTTPException(status_code=404, detail='search record not found')
+
+    title = full_record.get('song_name') or 'music'
+    platform = _music_source_to_platform(full_record.get('source', ''))
+    pseudo_url = f"musicsearch://{platform}/{int(time.time() * 1000)}/{uuid.uuid4().hex[:8]}"
+    song_id = db.add_song(pseudo_url, title=title)
+    if song_id == -1:
+        raise HTTPException(status_code=500, detail='Database Error')
+
+    db.update_song_media(
+        song_id=song_id,
+        media_type='music',
+        singers=full_record.get('singers', ''),
+        album=full_record.get('album', ''),
+        platform=platform,
+        fmt=full_record.get('ext', ''),
+        size_text=full_record.get('file_size', ''),
+    )
+
+    library_unique_key = f"{platform}:{title}:{full_record.get('singers', '')}:{full_record.get('album', '')}:{full_record.get('ext', '')}"
+    process_music_download_task(song_id, full_record, library_unique_key)
+    _huey_snapshot(limit=20)
+    return {'status': 'queued', 'id': song_id, 'title': title}
+
+
+@app.post('/music/queue/from_library')
+def music_queue_from_library(req: MusicLibraryQueueRequest):
+    item = db.get_music_library_item(req.library_id)
+    if not item:
+        raise HTTPException(status_code=404, detail='library item not found')
+
+    required_path = item.get('file_path')
+    if not required_path or not os.path.exists(_to_full_media_path(required_path)):
+        raise HTTPException(status_code=404, detail='no file')
+
+    pseudo_url = f"musiclib://{req.library_id}/{int(time.time() * 1000)}"
+    song_id = db.add_song(pseudo_url, title=item.get('title') or 'music')
+    if song_id == -1:
+        raise HTTPException(status_code=500, detail='Database Error')
+
+    db.update_paths(
+        song_id,
+        title=item.get('title', ''),
+        audio_path=item.get('file_path'),
+        raw_audio_path=item.get('raw_audio_path') or item.get('file_path'),
+    )
+    db.update_song_media(
+        song_id=song_id,
+        media_type='music',
+        singers=item.get('singers', ''),
+        album=item.get('album', ''),
+        platform=item.get('platform', ''),
+        fmt=item.get('format', ''),
+        size_text=item.get('size_text', ''),
+        cover_path=item.get('cover_path'),
+        lyric_path=item.get('lyric_path'),
+    )
+    db.update_status(song_id, 'completed', 100, status_detail='Restored from Music Library')
+    db.touch_music_library_item(req.library_id)
+    return {'status': 'queued', 'id': song_id, 'title': item.get('title')}
+
+
+@app.post('/music/queue/from_mv_library')
+def music_queue_from_mv_library(req: MVLibraryQueueRequest):
+    video_id = (req.video_id or '').strip()
+    if not video_id:
+        raise HTTPException(status_code=400, detail='video_id is required')
+
+    item = db.get_library_song(video_id)
+    if not item:
+        raise HTTPException(status_code=404, detail='mv library item not found')
+
+    required_video = item.get('video_path')
+    required_audio = item.get('audio_path')
+    if (not required_video or not os.path.exists(_to_full_media_path(required_video))
+            or not required_audio or not os.path.exists(_to_full_media_path(required_audio))):
+        raise HTTPException(status_code=404, detail='no file')
+
+    pseudo_url = f"mvlib://{video_id}/{int(time.time() * 1000)}"
+    song_id = db.add_song(pseudo_url, video_id=video_id, title=item.get('title') or 'video')
+    if song_id == -1:
+        raise HTTPException(status_code=500, detail='Database Error')
+
+    db.update_paths(
+        song_id,
+        title=item.get('title', ''),
+        video_path=item.get('video_path'),
+        audio_path=item.get('audio_path'),
+        raw_audio_path=item.get('raw_audio_path') or item.get('video_path'),
+        video_id=video_id,
+    )
+    db.update_song_media(
+        song_id=song_id,
+        media_type='video',
+        platform=item.get('platform', ''),
+    )
+    db.update_status(song_id, 'completed', 100, status_detail='Restored from MV Library')
+    db.save_to_library(
+        video_id,
+        item.get('title', ''),
+        item.get('video_path'),
+        item.get('audio_path'),
+        item.get('raw_audio_path'),
+        item.get('platform', ''),
+    )
+    return {'status': 'queued', 'id': song_id, 'title': item.get('title')}
+
+
+@app.get('/debug/huey')
+def debug_huey(limit: int = 50):
+    limit = max(1, min(200, int(limit or 50)))
+    return _huey_snapshot(limit=limit)
+
+
+@app.get('/debug/music_download_log')
+def debug_music_download_log(lines: int = 200):
+    lines = max(10, min(2000, int(lines or 200)))
+    if not os.path.exists(DEBUG_MUSIC_DOWNLOAD_LOG):
+        return {'exists': False, 'lines': []}
+    with open(DEBUG_MUSIC_DOWNLOAD_LOG, 'r', encoding='utf-8', errors='ignore') as fp:
+        all_lines = fp.readlines()
+    return {'exists': True, 'lines': [x.rstrip('\n') for x in all_lines[-lines:]]}
+
 @app.get("/songs")
 def list_songs():
     songs = db.get_all_songs()
+    filtered_songs = []
+
+    for s in songs:
+        if (s.get('status') or '') == 'completed' and _song_missing_required_files(s):
+            try:
+                db.update_status(s['id'], 'error', 0, error_msg='no file', status_detail='no file')
+            except Exception:
+                pass
+            db.delete_song(s['id'])
+            print(f"[QUEUE CLEANUP] removed missing file song id={s.get('id')}")
+            continue
+        filtered_songs.append(s)
+
+    songs = filtered_songs
     # Path processing
     for s in songs:
+        s['media_type'] = s.get('media_type') or 'video'
+        s['format'] = s.get('format') or ''
+        s['size_text'] = s.get('size_text') or ''
+        s['platform'] = s.get('platform') or ''
+        s['singers'] = s.get('singers') or ''
+        s['album'] = s.get('album') or ''
         if s['video_path']:
-
             try:
                 rel = os.path.relpath(s['video_path'], songs_dir).replace("\\", "/")
                 s['video_url'] = f"/songs/{rel}"
-            except ValueError: s['video_url'] = ""
-        
+            except ValueError:
+                s['video_url'] = ""
+
         if s['audio_path']:
-             try:
+            try:
                 rel = os.path.relpath(s['audio_path'], songs_dir).replace("\\", "/")
                 s['audio_url'] = f"/songs/{rel}"
-             except ValueError: s['audio_url'] = ""
+            except ValueError:
+                s['audio_url'] = ""
 
         if s.get('raw_audio_path'):
-             try:
+            try:
                 rel = os.path.relpath(s['raw_audio_path'], songs_dir).replace("\\", "/")
                 s['raw_audio_url'] = f"/songs/{rel}"
-             except ValueError: s['raw_audio_url'] = ""
+            except ValueError:
+                s['raw_audio_url'] = ""
+
+        if s.get('cover_path'):
+            try:
+                rel = os.path.relpath(s['cover_path'], songs_dir).replace("\\", "/")
+                s['cover_url'] = f"/songs/{rel}"
+            except ValueError:
+                s['cover_url'] = ""
+
+        if s.get('lyric_path'):
+            try:
+                rel = os.path.relpath(s['lyric_path'], songs_dir).replace("\\", "/")
+                s['lyric_url'] = f"/songs/{rel}"
+            except ValueError:
+                s['lyric_url'] = ""
 
     return songs
 
@@ -197,6 +618,14 @@ def get_song(song_id: int):
     song = db.get_song(song_id)
     if not song:
         raise HTTPException(status_code=404, detail="Song not found")
+
+    if (song.get('status') or '') == 'completed' and _song_missing_required_files(song):
+        try:
+            db.update_status(song_id, 'error', 0, error_msg='no file', status_detail='no file')
+        except Exception:
+            pass
+        db.delete_song(song_id)
+        raise HTTPException(status_code=404, detail='no file')
     
     # Inject URLs
     if song['video_path']:
@@ -213,6 +642,16 @@ def get_song(song_id: int):
         try:
              rel = os.path.relpath(song['raw_audio_path'], songs_dir).replace("\\", "/")
              song['raw_audio_url'] = f"/songs/{rel}"
+        except: pass
+    if song.get('cover_path'):
+        try:
+             rel = os.path.relpath(song['cover_path'], songs_dir).replace("\\", "/")
+             song['cover_url'] = f"/songs/{rel}"
+        except: pass
+    if song.get('lyric_path'):
+        try:
+             rel = os.path.relpath(song['lyric_path'], songs_dir).replace("\\", "/")
+             song['lyric_url'] = f"/songs/{rel}"
         except: pass
 
     return song

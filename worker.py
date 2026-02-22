@@ -2,6 +2,7 @@ import sys
 import os
 import subprocess
 import time
+import glob
 
 
 def start_consumer(queue_name: str):
@@ -18,12 +19,31 @@ def start_consumer(queue_name: str):
     return subprocess.Popen(cmd, cwd=os.getcwd())
 
 
+def cleanup_lock_files():
+    lock_dir = os.path.join("Temp", "locks")
+    if not os.path.isdir(lock_dir):
+        return
+
+    removed = 0
+    skipped = 0
+    for lock_path in glob.glob(os.path.join(lock_dir, "*.lock")):
+        try:
+            os.remove(lock_path)
+            removed += 1
+        except Exception:
+            skipped += 1
+
+    print(f"Lock cleanup: removed={removed}, skipped={skipped}")
+
+
 if __name__ == "__main__":
-    print("Starting Huey Workers (parse/download/separate)...")
+    print("Starting Huey Workers (parse/download/separate/music_serial)...")
+    cleanup_lock_files()
     processes = [
         start_consumer("parse"),
         start_consumer("download"),
-        start_consumer("separate")
+        start_consumer("separate"),
+        start_consumer("music_serial")
     ]
 
     try:
