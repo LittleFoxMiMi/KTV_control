@@ -1,0 +1,7 @@
+test/
+songs/
+MDX_Net_Models/
+node_modules/
+python/
+front_end/node_modules/
+__pycache__/

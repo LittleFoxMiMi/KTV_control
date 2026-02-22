@@ -1,0 +1,21 @@
+{
+    "paths": {
+        "songs_dir": "./songs",
+        "temp_dir": "./Temp",
+        "model_path": "./MDX_Net_Models/UVR_MDXNET_KARA_2.onnx",
+        "vocal_remover_script": "./src/vocal_remover.py",
+        "python_path": "./python/python.exe",
+        "ffmpeg_path": "ffmpeg",
+        "yt_dlp_path": "yt-dlp"
+    },
+    "processing": {
+        "gpu_id": 0,
+        "batch_size": 2,
+        "use_gpu": true,
+        "keep_vocals": false
+    },
+    "system": {
+        "port": 8000,
+        "host": "0.0.0.0"
+    }
+}
