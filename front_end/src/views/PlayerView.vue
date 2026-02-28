@@ -178,6 +178,28 @@ const syncMusicTracks = () => {
   }
 }
 
+const waitAudioReady = (audioEl, timeoutMs = 1500) => new Promise((resolve) => {
+  if (!audioEl) {
+    resolve()
+    return
+  }
+  if (audioEl.readyState >= 2) {
+    resolve()
+    return
+  }
+  let done = false
+  const onDone = () => {
+    if (done) return
+    done = true
+    audioEl.removeEventListener('canplay', onDone)
+    audioEl.removeEventListener('loadedmetadata', onDone)
+    resolve()
+  }
+  audioEl.addEventListener('canplay', onDone, { once: true })
+  audioEl.addEventListener('loadedmetadata', onDone, { once: true })
+  setTimeout(onDone, timeoutMs)
+})
+
 const parseLrc = (rawText) => {
   const lines = String(rawText || '').split(/\r?\n/)
   const parsed = []
@@ -216,14 +238,25 @@ const startMusicPlayback = async () => {
   const inst = instMusicRef.value
   if (!orig || !inst) return
 
+  if (musicSyncTimer) {
+    clearInterval(musicSyncTimer)
+    musicSyncTimer = null
+  }
+
+  await Promise.all([waitAudioReady(orig), waitAudioReady(inst)])
+
   orig.currentTime = 0
   inst.currentTime = 0
+  orig.playbackRate = 1
+  inst.playbackRate = 1
   applyMusicTrackMode()
 
-  await orig.play().catch(() => {})
-  await inst.play().catch(() => {})
+  await Promise.allSettled([orig.play(), inst.play()])
+  if (Math.abs(inst.currentTime - orig.currentTime) > 0.01) {
+    inst.currentTime = orig.currentTime
+  }
 
-  if (musicSyncTimer) clearInterval(musicSyncTimer)
+  syncMusicTracks()
   musicSyncTimer = setInterval(syncMusicTracks, 220)
 }
 
@@ -400,6 +433,7 @@ const handleRemoteCommand = (cmd) => {
   if (!playerRef.value) return
   switch (cmd.action) {
     case 'setTrack':
+      trackMode.value = cmd.value || 'original'
       playerRef.value.setTrack(cmd.value)
       break
     case 'setDelay':
@@ -520,7 +554,7 @@ onUnmounted(() => {
 }
 .lyric-line.active {
   color: #ffffff;
-  font-size: 56px;
+  font-size: 39.6px;
   transform: scale(1.02);
 }
 .no-lyric {

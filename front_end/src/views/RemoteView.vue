@@ -642,6 +642,11 @@ onUnmounted(() => {
 
 <style scoped>
 .remote-view { max-width: 680px; margin: 0 auto; padding: 12px 12px 90px; }
+.remote-view button:focus,
+.remote-view button:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
 .header { display: flex; justify-content: space-between; align-items: center; }
 .header h1 { margin: 0; font-size: 1.5em; line-height: 1.1; }
 .connection-status { width: 10px; height: 10px; background: red; border-radius: 50%; }

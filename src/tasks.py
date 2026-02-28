@@ -371,6 +371,22 @@ def _make_music_save_dir(source: str, song_name: str, singers: str) -> str:
     return save_dir
 
 
+def _format_size_text_from_bytes(file_size_bytes: int) -> str:
+    try:
+        size_val = int(file_size_bytes)
+    except Exception:
+        return ''
+    if size_val <= 0:
+        return ''
+    if size_val >= 1024 ** 3:
+        return f"{size_val / (1024 ** 3):.2f}GB"
+    if size_val >= 1024 ** 2:
+        return f"{size_val / (1024 ** 2):.2f}MB"
+    if size_val >= 1024:
+        return f"{size_val / 1024:.2f}KB"
+    return f"{size_val}B"
+
+
 @huey.task(queue=QUEUE_MUSIC_SERIAL)
 def process_music_download_task(song_id: int, song_record: dict, library_unique_key: str, library_item_id: int = None):
     with _task_lock("music_platform_serial"):
@@ -443,6 +459,18 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
             rel_cover = os.path.relpath(download_result['cover_path'], songs_dir) if download_result.get('cover_path') else None
             rel_lyric = os.path.relpath(download_result['lyric_path'], songs_dir) if download_result.get('lyric_path') else None
 
+            actual_format = os.path.splitext(instrumental_full_path)[1].lstrip('.').lower()
+            if not actual_format:
+                actual_format = str(download_result.get('ext', '') or '').strip().lower()
+
+            actual_size_text = ''
+            try:
+                actual_size_text = _format_size_text_from_bytes(os.path.getsize(instrumental_full_path))
+            except Exception:
+                actual_size_text = ''
+            if not actual_size_text:
+                actual_size_text = str(download_result.get('file_size', '') or '')
+
             db.update_paths(song_id, title=download_result.get('song_name', ''), audio_path=rel_audio, raw_audio_path=rel_raw_audio)
             db.update_song_media(
                 song_id=song_id,
@@ -450,8 +478,8 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
                 singers=download_result.get('singers', ''),
                 album=download_result.get('album', ''),
                 platform=_music_source_to_platform(download_result.get('source', '')),
-                fmt=download_result.get('ext', ''),
-                size_text=download_result.get('file_size', ''),
+                fmt=actual_format,
+                size_text=actual_size_text,
                 cover_path=rel_cover,
                 lyric_path=rel_lyric,
             )
@@ -462,8 +490,8 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
                 singers=download_result.get('singers', ''),
                 album=download_result.get('album', ''),
                 platform=_music_source_to_platform(download_result.get('source', '')),
-                fmt=download_result.get('ext', ''),
-                size_text=download_result.get('file_size', ''),
+                fmt=actual_format,
+                size_text=actual_size_text,
                 file_path=rel_audio,
                 raw_audio_path=rel_raw_audio,
                 cover_path=rel_cover,

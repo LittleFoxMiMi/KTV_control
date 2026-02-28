@@ -2,9 +2,10 @@ import json
 import os
 import copy
 import shutil
+from types import MethodType
 from http.cookiejar import MozillaCookieJar
 from typing import Dict, List, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from musicdl import musicdl
@@ -13,6 +14,7 @@ from musicdl.modules.sources import kuwo as kuwo_source
 from musicdl.modules.sources import netease as netease_source
 from musicdl.modules.utils import kugouutils as kugou_utils
 from musicdl.modules.utils import qqutils as qq_utils
+from musicdl.modules.utils import SongInfo, legalizestring, safeextractfromdict, resp2json
 from musicdl.modules.utils.misc import sanitize_filepath, touchdir
 
 
@@ -96,6 +98,7 @@ class MusicDLService:
             init_music_clients_cfg=self.init_music_clients_cfg,
             requests_overrides=requests_overrides,
         )
+        self._enable_jbsou_light_search(client, enabled=fast_search)
         if fast_search:
             for per_client in client.music_clients.values():
                 tester = getattr(per_client, 'audio_link_tester', None)
@@ -107,6 +110,71 @@ class MusicDLService:
                 except Exception:
                     continue
         return client
+
+    def _enable_jbsou_light_search(self, client: musicdl.MusicClient, enabled: bool = True) -> None:
+        if not enabled:
+            return
+        jbsou_client = getattr(client, 'music_clients', {}).get('JBSouMusicClient')
+        if jbsou_client is None:
+            return
+        if getattr(jbsou_client, '_ktv_light_search_enabled', False):
+            return
+
+        def _light_search(bound_self, keyword: str = '', search_url: dict = None, request_overrides: dict = None, song_infos: list = None, progress=None, progress_id: int = 0):
+            request_overrides = request_overrides or {}
+            song_infos = song_infos if isinstance(song_infos, list) else []
+            base_url = 'https://www.jbsou.cn/'
+            source = ((search_url or {}).get('data') or {}).get('type') or ''
+            try:
+                resp = bound_self.post(**(search_url or {}), **request_overrides)
+                resp.raise_for_status()
+                parsed_payload = resp2json(resp) or {}
+                search_results = parsed_payload.get('data') or []
+                debug_page = ((search_url or {}).get('data') or {}).get('page', '-')
+                print(f"[JBSOU RAW] source={source} keyword={keyword} page={debug_page} count={len(search_results) if isinstance(search_results, list) else 0}")
+                try:
+                    print(f"[JBSOU RAW DATA] {json.dumps(search_results, ensure_ascii=False)}")
+                except Exception:
+                    print(f"[JBSOU RAW DATA] {search_results}")
+                for search_result in search_results:
+                    if not isinstance(search_result, dict):
+                        continue
+                    song_id = search_result.get('songid')
+                    download_path = search_result.get('url')
+                    if not song_id or not download_path:
+                        continue
+                    download_url = urljoin(base_url, str(download_path))
+                    cover_url = urljoin(base_url, str(search_result.get('cover', '') or ''))
+                    ext = str(download_url).split('?')[0].split('.')[-1] if '.' in str(download_url).split('?')[0] else 'mp3'
+
+                    song_info = SongInfo(
+                        raw_data={'search': search_result, 'download': {}, 'lyric': {}},
+                        source=bound_self.source,
+                        root_source=source,
+                        song_name=legalizestring(safeextractfromdict(search_result, ['name'], None)),
+                        singers=legalizestring(str(safeextractfromdict(search_result, ['artist'], '')).replace('/', ', ')),
+                        album=legalizestring(search_result.get('album')),
+                        ext=ext or 'mp3',
+                        file_size='NULL',
+                        identifier=str(song_id),
+                        duration='-:-:-',
+                        lyric='NULL',
+                        cover_url=cover_url,
+                        download_url=download_url,
+                        download_url_status={'ok': True},
+                    )
+                    song_infos.append(song_info)
+                    if bound_self.strict_limit_search_size_per_page and len(song_infos) >= bound_self.search_size_per_page:
+                        break
+                if progress is not None:
+                    progress.update(progress_id, description=f"{bound_self.source}.search >>> {search_url} (Success, lightweight)")
+            except Exception as err:
+                if progress is not None:
+                    progress.update(progress_id, description=f"{bound_self.source}.search >>> {search_url} (Error: {err})")
+            return song_infos
+
+        jbsou_client._search = MethodType(_light_search, jbsou_client)
+        jbsou_client._ktv_light_search_enabled = True
 
     def _apply_runtime_quality_policy(self) -> None:
         try:
@@ -219,18 +287,18 @@ class MusicDLService:
         normalized_records = []
         for per_source_search_results in self.last_search_results.values():
             for per_source_search_result in per_source_search_results:
-                ext = per_source_search_result.get('ext', 'mp3')
+                ext = self._clean_nullish(per_source_search_result.get('ext', 'mp3'), default='mp3') or 'mp3'
                 normalized = {
                     'id': -1,
-                    'singers': per_source_search_result.get('singers', ''),
-                    'song_name': per_source_search_result.get('song_name', ''),
-                    'file_size': per_source_search_result.get('file_size', ''),
-                    'duration': per_source_search_result.get('duration', ''),
-                    'album': per_source_search_result.get('album', ''),
+                    'singers': self._clean_nullish(per_source_search_result.get('singers', ''), default=''),
+                    'song_name': self._clean_nullish(per_source_search_result.get('song_name', ''), default=''),
+                    'file_size': self._clean_nullish(per_source_search_result.get('file_size', ''), default=''),
+                    'duration': self._clean_nullish(per_source_search_result.get('duration', ''), default=''),
+                    'album': self._clean_nullish(per_source_search_result.get('album', ''), default=''),
                     'source': per_source_search_result.get('source', ''),
                     'download_url': per_source_search_result.get('download_url', ''),
                     'cover_url': per_source_search_result.get('cover_url', ''),
-                    'lyric': per_source_search_result.get('lyric', ''),
+                    'lyric': self._clean_nullish(per_source_search_result.get('lyric', ''), default=''),
                     'raw_search': (((per_source_search_result.get('raw_data') or {}) if isinstance(per_source_search_result.get('raw_data'), dict) else {}).get('search') or {}),
                     'work_dir': per_source_search_result.get('work_dir', ''),
                     'ext': ext,
@@ -294,6 +362,13 @@ class MusicDLService:
         return ''.join(str(text or '').lower().split())
 
     @staticmethod
+    def _clean_nullish(value, default: str = '') -> str:
+        text = str(value if value is not None else '').strip()
+        if text.lower() in {'null', 'none', 'nan'}:
+            return default
+        return text
+
+    @staticmethod
     def _is_mp3_ext(ext: str) -> bool:
         return str(ext or '').lower() == 'mp3'
 
@@ -326,6 +401,23 @@ class MusicDLService:
         if url.startswith('//'):
             return 'https:' + url
         return url
+
+    def _resolve_lyric_value(self, song_info: Dict) -> str:
+        lyric_value = self._clean_nullish(song_info.get('lyric', ''), default='')
+        if lyric_value:
+            return lyric_value
+
+        raw_search = song_info.get('raw_search') or {}
+        if not isinstance(raw_search, dict):
+            raw_search = {}
+        raw_lrc = self._clean_nullish(raw_search.get('lrc', ''), default='')
+        if not raw_lrc:
+            return ''
+        if raw_lrc.startswith('//'):
+            return 'https:' + raw_lrc
+        if raw_lrc.startswith('http://') or raw_lrc.startswith('https://'):
+            return raw_lrc
+        return urljoin('https://www.jbsou.cn/', raw_lrc)
 
     def _resolve_cover_url(self, song_info: Dict) -> str:
         source = song_info.get('source', '')
@@ -502,7 +594,7 @@ class MusicDLService:
                     warnings.append('cover download failed')
 
             lyric_path = None
-            lyric_value = song_info.get('lyric')
+            lyric_value = self._resolve_lyric_value(song_info)
             if download_lyric and lyric_value:
                 lyric_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.lrc'))
                 try:
@@ -583,7 +675,7 @@ class MusicDLService:
                     warnings.append('cover download failed')
 
             lyric_path = None
-            lyric_value = song_record.get('lyric')
+            lyric_value = self._resolve_lyric_value(song_record)
             if download_lyric and lyric_value:
                 lyric_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.lrc'))
                 try:
