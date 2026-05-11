@@ -408,107 +408,132 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
             )
 
             raw_audio_full_path = download_result['file_path']
-            db.update_status(song_id, 'processing', 0, status_detail='Removing Vocals...')
-
-            python_path = config.get('paths', {}).get('python_path', 'python')
-            vocal_remover_script = config.get('paths', {}).get('vocal_remover_script', 'src/vocal_remover.py')
-            gpu_id = config.get('processing', {}).get('gpu_id', 0)
-            instrumental_full_path = os.path.join(save_dir, 'instrumental.mp3')
-
-            sep_cmd = [
-                python_path,
-                vocal_remover_script,
-                '-i', raw_audio_full_path,
-                '-gpu',
-                '-id', str(gpu_id),
-                '--denoise',
-                '-o', instrumental_full_path,
-            ]
-            sep_output_lines = []
-            with _task_lock("vocal_separate_gpu"):
-                sep_proc = subprocess.Popen(
-                    sep_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors='replace',
-                )
-                sep_progress_re = re.compile(r'\[PROGRESS\]\s*(\d+)')
-                while True:
-                    line = sep_proc.stdout.readline() if sep_proc.stdout else ''
-                    if not line and sep_proc.poll() is not None:
-                        break
-                    if not line:
-                        continue
-                    line = line.strip()
-                    if line:
-                        print(f"[MUSIC DOWNLOAD][HUEY][SEP] {line}")
-                        sep_output_lines.append(line)
-                        matched = sep_progress_re.search(line)
-                        if matched:
-                            sep_pct = max(0, min(100, int(matched.group(1))))
-                            db.update_status(song_id, 'processing', sep_pct, status_detail='Removing Vocals...')
-
-                sep_return_code = sep_proc.poll()
-            if sep_return_code != 0 or not os.path.exists(instrumental_full_path):
-                err_text = ('\n'.join(sep_output_lines[-20:]) or 'separation failed').strip()
-                raise RuntimeError(f'vocal separation failed: {err_text}')
-
-            rel_audio = os.path.relpath(instrumental_full_path, songs_dir)
             rel_raw_audio = os.path.relpath(raw_audio_full_path, songs_dir)
-            rel_cover = os.path.relpath(download_result['cover_path'], songs_dir) if download_result.get('cover_path') else None
-            rel_lyric = os.path.relpath(download_result['lyric_path'], songs_dir) if download_result.get('lyric_path') else None
-
-            actual_format = os.path.splitext(instrumental_full_path)[1].lstrip('.').lower()
-            if not actual_format:
-                actual_format = str(download_result.get('ext', '') or '').strip().lower()
-
-            actual_size_text = ''
-            try:
-                actual_size_text = _format_size_text_from_bytes(os.path.getsize(instrumental_full_path))
-            except Exception:
-                actual_size_text = ''
-            if not actual_size_text:
-                actual_size_text = str(download_result.get('file_size', '') or '')
-
-            db.update_paths(song_id, title=download_result.get('song_name', ''), audio_path=rel_audio, raw_audio_path=rel_raw_audio)
-            db.update_song_media(
-                song_id=song_id,
-                media_type='music',
-                singers=download_result.get('singers', ''),
-                album=download_result.get('album', ''),
-                platform=_music_source_to_platform(download_result.get('source', '')),
-                fmt=actual_format,
-                size_text=actual_size_text,
-                cover_path=rel_cover,
-                lyric_path=rel_lyric,
-            )
-            db.update_status(song_id, 'completed', 100, status_detail='Music Ready')
-
-            lib_id = db.save_music_library_item(
-                title=download_result.get('song_name', ''),
-                singers=download_result.get('singers', ''),
-                album=download_result.get('album', ''),
-                platform=_music_source_to_platform(download_result.get('source', '')),
-                fmt=actual_format,
-                size_text=actual_size_text,
-                file_path=rel_audio,
-                raw_audio_path=rel_raw_audio,
-                cover_path=rel_cover,
-                lyric_path=rel_lyric,
-                unique_key=library_unique_key,
-            )
-            if library_item_id:
-                db.touch_music_library_item(library_item_id)
-            elif lib_id:
-                db.touch_music_library_item(lib_id)
-
-            print(f"[MUSIC DOWNLOAD][HUEY] done song_id={song_id}")
+            db.update_paths(song_id, title=download_result.get('song_name', ''), raw_audio_path=rel_raw_audio)
+            db.update_status(song_id, 'processing', 0, status_detail='Dispatching Separation...')
+            
+            # Offload heavy separation to the QUEUE_SEPARATE worker
+            # so that QUEUE_MUSIC_SERIAL (search & download) won't be blocked.
+            separate_music_song_task(song_id, download_result, save_dir, library_unique_key, library_item_id)
+            
+            print(f"[MUSIC DOWNLOAD][HUEY] done song_id={song_id}, dispatched to separation queue.")
         except Exception as exc:
             traceback_text = traceback.format_exc()
             print(f"[MUSIC DOWNLOAD][HUEY] failed song_id={song_id} error={exc}\n{traceback_text}")
             db.update_status(song_id, 'error', 0, error_msg=str(exc), status_detail='Music Download Failed')
 
+
+@huey.task(queue=QUEUE_SEPARATE)
+def separate_music_song_task(song_id: int, download_result: dict, save_dir: str, library_unique_key: str, library_item_id: int = None):
+    songs_dir = config.get("paths", {}).get("songs_dir", "./songs")
+    try:
+        raw_audio_full_path = download_result['file_path']
+        db.update_status(song_id, 'processing', 0, status_detail='Removing Vocals...')
+
+        python_path = config.get('paths', {}).get('python_path', 'python')
+        vocal_remover_script = config.get('paths', {}).get('vocal_remover_script', 'src/vocal_remover.py')
+        gpu_id = config.get('processing', {}).get('gpu_id', 0)
+        
+        is_player_local = db.get_setting('player_on_localhost') == 'true'
+        is_playing = any(s.get('status') == 'completed' for s in db.get_all_songs())
+        
+        if is_player_local and is_playing:
+            vocal_remover_script = config.get('paths', {}).get('new_vocal_remover_script', 'src/new_vocal_remover.py')
+            
+        instrumental_full_path = os.path.join(save_dir, 'instrumental.mp3')
+
+        sep_cmd = [
+            python_path,
+            vocal_remover_script,
+            '-i', raw_audio_full_path,
+            '-gpu',
+            '-id', str(gpu_id),
+            '--denoise',
+            '-o', instrumental_full_path,
+        ]
+        sep_output_lines = []
+        with _task_lock("vocal_separate_gpu"):
+            sep_proc = subprocess.Popen(
+                sep_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors='replace',
+            )
+            sep_progress_re = re.compile(r'\[PROGRESS\]\s*(\d+)')
+            while True:
+                line = sep_proc.stdout.readline() if sep_proc.stdout else ''
+                if not line and sep_proc.poll() is not None:
+                    break
+                if not line:
+                    continue
+                line = line.strip()
+                if line:
+                    print(f"[MUSIC DOWNLOAD][HUEY][SEP] {line}")
+                    sep_output_lines.append(line)
+                    matched = sep_progress_re.search(line)
+                    if matched:
+                        sep_pct = max(0, min(100, int(matched.group(1))))
+                        db.update_status(song_id, 'processing', sep_pct, status_detail='Removing Vocals...')
+
+            sep_return_code = sep_proc.poll()
+        if sep_return_code != 0 or not os.path.exists(instrumental_full_path):
+            err_text = ('\n'.join(sep_output_lines[-20:]) or 'separation failed').strip()
+            raise RuntimeError(f'vocal separation failed: {err_text}')
+
+        rel_audio = os.path.relpath(instrumental_full_path, songs_dir)
+        rel_raw_audio = os.path.relpath(raw_audio_full_path, songs_dir)
+        rel_cover = os.path.relpath(download_result['cover_path'], songs_dir) if download_result.get('cover_path') else None
+        rel_lyric = os.path.relpath(download_result['lyric_path'], songs_dir) if download_result.get('lyric_path') else None
+
+        actual_format = os.path.splitext(instrumental_full_path)[1].lstrip('.').lower()
+        if not actual_format:
+            actual_format = str(download_result.get('ext', '') or '').strip().lower()
+
+        actual_size_text = ''
+        try:
+            actual_size_text = _format_size_text_from_bytes(os.path.getsize(instrumental_full_path))
+        except Exception:
+            actual_size_text = ''
+        if not actual_size_text:
+            actual_size_text = str(download_result.get('file_size', '') or '')
+
+        db.update_paths(song_id, title=download_result.get('song_name', ''), audio_path=rel_audio, raw_audio_path=rel_raw_audio)
+        db.update_song_media(
+            song_id=song_id,
+            media_type='music',
+            singers=download_result.get('singers', ''),
+            album=download_result.get('album', ''),
+            platform=_music_source_to_platform(download_result.get('source', '')),
+            fmt=actual_format,
+            size_text=actual_size_text,
+            cover_path=rel_cover,
+            lyric_path=rel_lyric,
+        )
+        db.update_status(song_id, 'completed', 100, status_detail='Music Ready')
+
+        lib_id = db.save_music_library_item(
+            title=download_result.get('song_name', ''),
+            singers=download_result.get('singers', ''),
+            album=download_result.get('album', ''),
+            platform=_music_source_to_platform(download_result.get('source', '')),
+            fmt=actual_format,
+            size_text=actual_size_text,
+            file_path=rel_audio,
+            raw_audio_path=rel_raw_audio,
+            cover_path=rel_cover,
+            lyric_path=rel_lyric,
+            unique_key=library_unique_key,
+        )
+        if library_item_id:
+            db.touch_music_library_item(library_item_id)
+        elif lib_id:
+            db.touch_music_library_item(lib_id)
+
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        print(f"[MUSIC DOWNLOAD][HUEY] failed separation song_id={song_id} error={exc}\n{traceback_text}")
+        db.update_status(song_id, 'error', 0, error_msg=str(exc), status_detail='Separation Failed')
 
 @huey.task(queue=QUEUE_MUSIC_SERIAL)
 def process_music_search_jb_task(job_id: str, keyword: str):
@@ -866,6 +891,12 @@ def separate_song_task(song_id: int):
             python_path = config['paths'].get('python_path', 'python')
             vocal_remover_script = config['paths'].get('vocal_remover_script', 'src/vocal_remover.py')
             gpu_id = config.get("processing", {}).get("gpu_id", 0)
+            
+            is_player_local = db.get_setting('player_on_localhost') == 'true'
+            is_playing = any(s.get('status') == 'completed' for s in db.get_all_songs())
+            
+            if is_player_local and is_playing:
+                vocal_remover_script = config['paths'].get('new_vocal_remover_script', 'src/new_vocal_remover.py')
 
             sep_cmd = [
                 python_path,

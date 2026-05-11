@@ -15,7 +15,7 @@ from musicdl.modules.sources import netease as netease_source
 from musicdl.modules.utils import kugouutils as kugou_utils
 from musicdl.modules.utils import qqutils as qq_utils
 from musicdl.modules.utils import SongInfo, legalizestring, safeextractfromdict, resp2json
-from musicdl.modules.utils.misc import sanitize_filepath, touchdir
+from musicdl.modules.utils.misc import sanitize_filepath
 
 
 class MusicDLService:
@@ -23,7 +23,7 @@ class MusicDLService:
         self.cookies_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'cookies'))
         self.musicdl_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Temp', 'musicdl_outputs'))
         self.legacy_musicdl_outputs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'musicdl_outputs'))
-        touchdir(self.musicdl_cache_dir)
+        os.makedirs(self.musicdl_cache_dir, exist_ok=True)
         self.default_sources = music_sources or [
             'JBSouMusicClient',
             'QQMusicClient',
@@ -32,7 +32,7 @@ class MusicDLService:
             'NeteaseMusicClient',
         ]
         self.init_music_clients_cfg = {
-            'JBSouMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'JBSouMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
             'QQMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
             'NeteaseMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
             'KuwoMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
@@ -125,6 +125,8 @@ class MusicDLService:
             song_infos = song_infos if isinstance(song_infos, list) else []
             base_url = 'https://www.jbsou.cn/'
             source = ((search_url or {}).get('data') or {}).get('type') or ''
+            if source in ['netease', 'qq']:
+                return song_infos
             try:
                 resp = bound_self.post(**(search_url or {}), **request_overrides)
                 resp.raise_for_status()
@@ -487,6 +489,22 @@ class MusicDLService:
                         fp.write(chunk)
         return save_path
 
+    def _fix_file_extension(self, file_path: str, current_ext: str, song_name: str, save_dir: str):
+        try:
+            import filetype
+            kind = filetype.guess(file_path)
+            if kind is not None:
+                real_ext = kind.extension
+                if current_ext in ['php'] or real_ext in ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg'] and real_ext != current_ext:
+                    new_file_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.{real_ext}'))
+                    if os.path.exists(new_file_path):
+                        os.remove(new_file_path)
+                    os.rename(file_path, new_file_path)
+                    return new_file_path, real_ext, None
+        except Exception as e:
+            return file_path, current_ext, f'failed to resolve real extension: {e}'
+        return file_path, current_ext, None
+
     def _cleanup_musicdl_output_dirs(self) -> None:
         for output_dir in [self.musicdl_cache_dir, self.legacy_musicdl_outputs_dir]:
             if not output_dir or not os.path.isdir(output_dir):
@@ -569,19 +587,27 @@ class MusicDLService:
                 raise ValueError(f'song id {song_id} has no download url')
 
             source = song_info.get('source', '')
-            headers = self.music_client.music_clients[source].default_download_headers
+            headers = {}
+            if self.music_client and source in getattr(self.music_client, 'music_clients', {}):
+                client_obj = self.music_client.music_clients[source]
+                headers = getattr(client_obj, 'default_download_headers', getattr(client_obj, 'default_headers', {}))
+            if not headers:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'}
 
             session = requests.Session()
             if cookies_file:
                 session.cookies.update(self._load_cookies_from_file(cookies_file))
 
-            touchdir(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
             song_name = song_info.get('song_name', f'song_{song_id}')
             ext = song_info.get('ext', 'mp3')
             file_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.{ext}'))
             warnings: List[str] = []
 
             self._download_binary_file(session, download_url, file_path, headers=headers)
+            file_path, ext, fix_warn = self._fix_file_extension(file_path, ext, song_name, save_dir)
+            if fix_warn:
+                warnings.append(fix_warn)
 
             cover_path = None
             cover_url = self._resolve_cover_url(song_info)
@@ -647,22 +673,25 @@ class MusicDLService:
             source = song_record.get('source', '')
             headers = {}
             if self.music_client and source in getattr(self.music_client, 'music_clients', {}):
-                try:
-                    headers = self.music_client.music_clients[source].default_download_headers
-                except Exception:
-                    headers = {}
+                client_obj = self.music_client.music_clients[source]
+                headers = getattr(client_obj, 'default_download_headers', getattr(client_obj, 'default_headers', {}))
+            if not headers:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'}
 
             session = requests.Session()
             if cookies_file:
                 session.cookies.update(self._load_cookies_from_file(cookies_file))
 
-            touchdir(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
             song_name = song_record.get('song_name') or 'song'
             ext = song_record.get('ext') or 'mp3'
             file_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.{ext}'))
             warnings: List[str] = []
 
             self._download_binary_file(session, download_url, file_path, headers=headers)
+            file_path, ext, fix_warn = self._fix_file_extension(file_path, ext, song_name, save_dir)
+            if fix_warn:
+                warnings.append(fix_warn)
 
             cover_path = None
             cover_url = self._resolve_cover_url(song_record)

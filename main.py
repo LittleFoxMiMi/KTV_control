@@ -74,10 +74,20 @@ class ConnectionManager:
         self.players: List[WebSocket] = []
         self.remotes: List[WebSocket] = []
 
+    def _update_localhost_player_state(self):
+        has_local = False
+        for p in self.players:
+            host = p.client.host
+            if host in ['127.0.0.1', 'localhost', '::1']:
+                has_local = True
+                break
+        db.set_setting('player_on_localhost', 'true' if has_local else 'false')
+
     async def connect(self, websocket: WebSocket, client_type: str):
         await websocket.accept()
         if client_type == 'player':
             self.players.append(websocket)
+            self._update_localhost_player_state()
             print(f"Player Connected. Total: {len(self.players)}")
         else:
             self.remotes.append(websocket)
@@ -86,6 +96,7 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket, client_type: str):
         if client_type == 'player' and websocket in self.players:
             self.players.remove(websocket)
+            self._update_localhost_player_state()
         elif client_type != 'player' and websocket in self.remotes:
             self.remotes.remove(websocket)
 
