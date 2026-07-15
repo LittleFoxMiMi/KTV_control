@@ -6,3 +6,5 @@ python/
 front_end/node_modules/
 __pycache__/
 Temp/
+/database/
+/cookies/

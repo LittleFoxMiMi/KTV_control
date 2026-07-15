@@ -31,7 +31,9 @@ else:
     }
 
 # Tasks Setup
-huey = SqliteHuey(filename='tasks.db')
+TASK_DB_PATH = os.path.join('database', 'tasks.db')
+os.makedirs(os.path.dirname(TASK_DB_PATH), exist_ok=True)
+huey = SqliteHuey(filename=TASK_DB_PATH)
 db = SongDatabase()
 
 QUEUE_PARSE = 'parse'
@@ -656,7 +658,7 @@ def process_song_task(song_id: int):
             cookies_path = os.path.join("cookies", "cookies.txt")
             cookies_arg = ['--cookies', cookies_path] if os.path.exists(cookies_path) else []
             res = subprocess.run(
-                [yt_dlp_path, song['url'], '-j', '--playlist-items', '1', '--no-playlist'] + cookies_arg,
+                [yt_dlp_path, song['url'], '-j', '--playlist-items', '1', '--no-playlist', '--add-header', 'Origin:https://www.bilibili.com', '--add-header', 'Referer:https://www.bilibili.com','--concurrent-fragments', '1'] + cookies_arg,
                 capture_output=True, text=True, encoding='utf-8', errors='ignore'
             )
             if res.returncode == 0 and res.stdout:

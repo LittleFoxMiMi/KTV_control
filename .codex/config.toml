@@ -1,0 +1,8 @@
+sandbox_mode = "danger-full-access"
+[mcp_servers.filesystem]
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "C:/Users/littlefoxtail/Desktop/software/KTV_control",
+]
