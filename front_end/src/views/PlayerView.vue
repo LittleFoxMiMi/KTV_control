@@ -15,11 +15,15 @@
     <div v-else-if="currentSong && isMusicMode" class="music-mode">
       <audio
         ref="origMusicRef"
+        crossorigin
         :src="getMediaUrl(currentSong.raw_audio_path || currentSong.audio_path)"
         @ended="onSongEnded"
         @timeupdate="onMusicTimeUpdate"
       ></audio>
-      <audio ref="instMusicRef" :src="getMediaUrl(currentSong.audio_path)"></audio>
+      <audio ref="instMusicRef" crossorigin :src="getMediaUrl(currentSong.audio_path)"></audio>
+      <div v-if="musicNeedsGesture" class="music-gesture-overlay" @click="unlockMusicAudio">
+        点击屏幕启用声音
+      </div>
 
       <div class="cover-panel">
         <img v-if="musicCoverUrl" :src="musicCoverUrl" class="cover-img" alt="cover" />
@@ -68,10 +72,11 @@
 import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import axios from 'axios'
 import KTVPlayer from '../components/KTVPlayer.vue'
+import { AudioEngine } from '../audio/AudioEngine.js'
+import { hardAlignTracks, syncFollowerToMaster } from '../audio/audioSync.js'
+import { API_BASE, getWebSocketUrl } from '../network.js'
 
-const getHost = () => window.location.hostname
-const API_BASE = `http://${getHost()}:8000`
-const WS_BASE = `ws://${getHost()}:8000/ws/player`
+const WS_BASE = getWebSocketUrl('/ws/player')
 
 const currentSong = ref(null)
 const songs = ref([])
@@ -84,22 +89,24 @@ const lyricLines = ref([])
 const activeLyricIndex = ref(-1)
 const musicCoverUrl = ref('')
 const showSongOverlay = ref(false)
+const musicNeedsGesture = ref(false)
 
 const trackMode = ref('original')
 const volOrigSolo = ref(100)
 const volInstSolo = ref(100)
 const volOrigMix = ref(80)
 const volInstMix = ref(80)
+const pitchSemitones = ref(0)
+const pitchEnabled = ref(false)
 
 let ws = null
 let refreshInterval = null
 let musicSyncTimer = null
 let songOverlayTimer = null
+let musicAudioEngine = null
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-const SOFT_SYNC_MIN_DRIFT = 0.015
-const SOFT_SYNC_MAX_RATE_DELTA = 0.03
-const PAIR_HARD_SEEK_THRESHOLD = isMobile ? 0.12 : 0.09
+const MUSIC_SYNC_INTERVAL_MS = isMobile ? 100 : 70
 
 const nextSong = computed(() => (songs.value.length > 0 ? songs.value[0] : null))
 const isMusicMode = computed(() => (currentSong.value?.media_type || 'video') === 'music')
@@ -120,36 +127,27 @@ const applyMusicTrackMode = () => {
   if (!orig || !inst) return
 
   const silent = 0.001
+  let originalGain = silent
+  let instrumentalGain = silent
   if (trackMode.value === 'original') {
-    orig.volume = volOrigSolo.value / 100
-    inst.volume = silent
+    originalGain = volOrigSolo.value / 100
   } else if (trackMode.value === 'instrumental') {
-    orig.volume = silent
-    inst.volume = volInstSolo.value / 100
+    instrumentalGain = volInstSolo.value / 100
   } else {
-    orig.volume = volOrigMix.value / 100
-    inst.volume = volInstMix.value / 100
+    originalGain = volOrigMix.value / 100
+    instrumentalGain = volInstMix.value / 100
+  }
+
+  if (musicAudioEngine) {
+    musicAudioEngine.setTrackGains(originalGain, instrumentalGain)
+  } else {
+    orig.volume = originalGain
+    inst.volume = instrumentalGain
   }
 }
 
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
-
-const applySoftRateSync = (audioEl, targetTime, baseRate = 1) => {
-  if (!audioEl) return 0
-  const drift = targetTime - audioEl.currentTime
-  const absDrift = Math.abs(drift)
-
-  if (absDrift <= SOFT_SYNC_MIN_DRIFT) {
-    if (Math.abs(audioEl.playbackRate - baseRate) > 0.003) {
-      audioEl.playbackRate = baseRate
-    }
-    return absDrift
-  }
-
-  const desiredDelta = clamp(absDrift * 0.18, 0.004, SOFT_SYNC_MAX_RATE_DELTA)
-  const nextRate = drift > 0 ? baseRate + desiredDelta : baseRate - desiredDelta
-  audioEl.playbackRate = clamp(nextRate, 0.96, 1.04)
-  return absDrift
+const applyMusicPitch = () => {
+  musicAudioEngine?.setPitch(pitchSemitones.value, pitchEnabled.value)
 }
 
 const syncMusicTracks = () => {
@@ -163,19 +161,9 @@ const syncMusicTracks = () => {
   }
   if (inst.paused) inst.play().catch(() => {})
 
-  const baseRate = orig.playbackRate || 1
-  const pairDrift = inst.currentTime - orig.currentTime
-  const absPairDrift = Math.abs(pairDrift)
-
-  if (absPairDrift > PAIR_HARD_SEEK_THRESHOLD) {
-    inst.currentTime = orig.currentTime
-    inst.playbackRate = baseRate
-  } else {
-    applySoftRateSync(inst, orig.currentTime, baseRate)
-    if (Math.abs(orig.playbackRate - baseRate) > 0.003) {
-      orig.playbackRate = baseRate
-    }
-  }
+  const baseRate = 1
+  orig.playbackRate = baseRate
+  syncFollowerToMaster(orig, inst, baseRate)
 }
 
 const waitAudioReady = (audioEl, timeoutMs = 1500) => new Promise((resolve) => {
@@ -245,19 +233,55 @@ const startMusicPlayback = async () => {
 
   await Promise.all([waitAudioReady(orig), waitAudioReady(inst)])
 
-  orig.currentTime = 0
-  inst.currentTime = 0
-  orig.playbackRate = 1
-  inst.playbackRate = 1
+  if (!musicAudioEngine) {
+    try {
+      musicAudioEngine = new AudioEngine(orig, inst)
+      await musicAudioEngine.init()
+      applyMusicPitch()
+    } catch (e) {
+      console.error('High-quality music pitch shift unavailable; using original media output', e)
+      musicAudioEngine = null
+    }
+  }
+
+  hardAlignTracks(orig, inst, 0, 1)
   applyMusicTrackMode()
 
-  await Promise.allSettled([orig.play(), inst.play()])
+  try {
+    const running = await musicAudioEngine?.resume()
+    if (musicAudioEngine && !running) {
+      musicNeedsGesture.value = true
+      return
+    }
+  } catch (e) {
+    musicNeedsGesture.value = true
+    return
+  }
+
+  musicNeedsGesture.value = false
+  const playResults = await Promise.allSettled([orig.play(), inst.play()])
+  if (playResults.some((result) => result.status === 'rejected')) {
+    orig.pause()
+    inst.pause()
+    musicNeedsGesture.value = true
+    return
+  }
   if (Math.abs(inst.currentTime - orig.currentTime) > 0.01) {
     inst.currentTime = orig.currentTime
   }
 
   syncMusicTracks()
-  musicSyncTimer = setInterval(syncMusicTracks, 220)
+  musicSyncTimer = setInterval(syncMusicTracks, MUSIC_SYNC_INTERVAL_MS)
+}
+
+const unlockMusicAudio = async () => {
+  try {
+    await musicAudioEngine?.resume()
+    musicNeedsGesture.value = false
+    await startMusicPlayback()
+  } catch (e) {
+    musicNeedsGesture.value = true
+  }
 }
 
 const stopMusicPlayback = () => {
@@ -267,6 +291,9 @@ const stopMusicPlayback = () => {
   }
   if (origMusicRef.value && !origMusicRef.value.paused) origMusicRef.value.pause()
   if (instMusicRef.value && !instMusicRef.value.paused) instMusicRef.value.pause()
+  if (musicAudioEngine) musicAudioEngine.dispose()
+  musicAudioEngine = null
+  musicNeedsGesture.value = false
 }
 
 const fetchSongs = async () => {
@@ -374,8 +401,28 @@ watch([trackMode, volOrigSolo, volInstSolo, volOrigMix, volInstMix], () => {
   if (isMusicMode.value) applyMusicTrackMode()
 })
 
+watch([pitchSemitones, pitchEnabled], () => {
+  if (isMusicMode.value) applyMusicPitch()
+})
+
+const refreshPitchState = async () => {
+  try {
+    const res = await axios.get(`${API_BASE}/state`)
+    const s = res.data || {}
+    if (s.pitchSemitones !== undefined) pitchSemitones.value = Number(s.pitchSemitones)
+    if (s.pitchEnabled !== undefined) pitchEnabled.value = s.pitchEnabled === '1' || s.pitchEnabled === 'true'
+    if (isMusicMode.value) {
+      applyMusicPitch()
+    } else if (playerRef.value) {
+      playerRef.value.setPitch(pitchSemitones.value)
+      playerRef.value.setPitchEnabled(pitchEnabled.value)
+    }
+  } catch (e) {}
+}
+
 const connectWS = () => {
   ws = new WebSocket(WS_BASE)
+  ws.onopen = () => refreshPitchState()
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data)
     handleRemoteCommand(data)
@@ -405,6 +452,16 @@ const handleRemoteCommand = (cmd) => {
       }
       case 'setDelay':
       case 'setDelayEnabled':
+        break
+      case 'setPitch':
+        pitchSemitones.value = Number(cmd.value) || 0
+        applyMusicPitch()
+        syncMusicTracks()
+        break
+      case 'setPitchEnabled':
+        pitchEnabled.value = !!cmd.value
+        applyMusicPitch()
+        syncMusicTracks()
         break
       case 'skip':
         skipCurrentOrHead()
@@ -445,6 +502,14 @@ const handleRemoteCommand = (cmd) => {
     case 'setVolume':
       playerRef.value.setVolume(cmd.target, cmd.value)
       break
+    case 'setPitch':
+      pitchSemitones.value = Number(cmd.value) || 0
+      playerRef.value.setPitch(cmd.value)
+      break
+    case 'setPitchEnabled':
+      pitchEnabled.value = !!cmd.value
+      playerRef.value.setPitchEnabled(!!cmd.value)
+      break
     case 'skip':
       skipCurrentOrHead()
       break
@@ -468,6 +533,8 @@ onMounted(async () => {
     if (s.volInstSolo) volInstSolo.value = Number(s.volInstSolo)
     if (s.volOrigMix) volOrigMix.value = Number(s.volOrigMix)
     if (s.volInstMix) volInstMix.value = Number(s.volInstMix)
+    if (s.pitchSemitones !== undefined) pitchSemitones.value = Number(s.pitchSemitones)
+    if (s.pitchEnabled !== undefined) pitchEnabled.value = s.pitchEnabled === '1' || s.pitchEnabled === 'true'
   } catch (e) {}
 
   fetchSongs()
@@ -507,10 +574,22 @@ onUnmounted(() => {
   padding: 8px 14px;
 }
 .music-mode {
+  position: relative;
   width: 100%;
   height: 100%;
   display: grid;
   grid-template-columns: 40% 60%;
+}
+.music-gesture-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  font-size: 24px;
+  cursor: pointer;
 }
 .cover-panel {
   display: flex;

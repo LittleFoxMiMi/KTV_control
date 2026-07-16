@@ -16,7 +16,11 @@
     },
     "system": {
         "port": 8000,
-        "host": "0.0.0.0"
+        "https_port": 8443,
+        "host": "0.0.0.0",
+        "public_hostname": "aquachan.tail83f9dc.ts.net",
+        "ssl_certfile": "./cert/aquachan.tail83f9dc.ts.net.crt",
+        "ssl_keyfile": "./cert/aquachan.tail83f9dc.ts.net.key"
     },
     "music": {
         "cookie_file_map": {

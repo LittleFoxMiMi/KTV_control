@@ -34,6 +34,22 @@
           </div>
         </div>
 
+        <div class="control-group pitch-control">
+          <label>音调：{{ pitchSemitones > 0 ? `+${pitchSemitones}` : pitchSemitones }} 半音</label>
+          <div class="stepper">
+            <button @click="updatePitch(pitchSemitones - 1)" class="step-btn">-</button>
+            <div class="step-val">{{ pitchSemitones > 0 ? `+${pitchSemitones}` : pitchSemitones }}</div>
+            <button @click="updatePitch(pitchSemitones + 1)" class="step-btn">+</button>
+          </div>
+          <button
+            class="pitch-toggle"
+            :class="{ active: pitchEnabled }"
+            @click="togglePitch"
+          >
+            {{ pitchEnabled ? '应用音调' : '不应用音调' }}
+          </button>
+        </div>
+
         <div v-if="trackMode === 'original'" class="control-group">
           <label>Vocals Vol</label>
           <div class="stepper">
@@ -184,10 +200,9 @@
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
 import axios from 'axios'
+import { API_BASE, getWebSocketUrl } from '../network.js'
 
-const getHost = () => window.location.hostname
-const API_BASE = `http://${getHost()}:8000`
-const WS_BASE = `ws://${getHost()}:8000/ws/remote`
+const WS_BASE = getWebSocketUrl('/ws/remote')
 
 const activeTab = ref('remote')
 const isConnected = ref(false)
@@ -207,6 +222,8 @@ const volOrigSolo = ref(100)
 const volInstSolo = ref(100)
 const volOrigMix = ref(80)
 const volInstMix = ref(80)
+const pitchSemitones = ref(0)
+const pitchEnabled = ref(false)
 
 const musicKeyword = ref('')
 const localSearchRecords = ref([])
@@ -230,6 +247,25 @@ let refreshInterval = null
 const onResize = () => {
   updateOverflow()
   updateSearchOverflow()
+}
+
+const applyControlState = (s = {}) => {
+  if (s.trackMode) trackMode.value = s.trackMode
+  if (s.delay !== undefined) delay.value = Number(s.delay)
+  if (s.delayEnabled !== undefined) delayEnabled.value = s.delayEnabled === '1' || s.delayEnabled === 'true'
+  if (s.volOrigSolo !== undefined) volOrigSolo.value = Number(s.volOrigSolo)
+  if (s.volInstSolo !== undefined) volInstSolo.value = Number(s.volInstSolo)
+  if (s.volOrigMix !== undefined) volOrigMix.value = Number(s.volOrigMix)
+  if (s.volInstMix !== undefined) volInstMix.value = Number(s.volInstMix)
+  if (s.pitchSemitones !== undefined) pitchSemitones.value = Number(s.pitchSemitones)
+  if (s.pitchEnabled !== undefined) pitchEnabled.value = s.pitchEnabled === '1' || s.pitchEnabled === 'true'
+}
+
+const refreshControlState = async () => {
+  try {
+    const res = await axios.get(`${API_BASE}/state`)
+    applyControlState(res.data)
+  } catch (e) {}
 }
 
 const reversedQueue = computed(() => {
@@ -324,13 +360,18 @@ const toCnSource = (source) => {
 
 const connectWS = () => {
   ws = new WebSocket(WS_BASE)
-  ws.onopen = () => (isConnected.value = true)
+  ws.onopen = () => {
+    isConnected.value = true
+    refreshControlState()
+  }
   ws.onmessage = (event) => {
     try {
       const cmd = JSON.parse(event.data)
       if (cmd.action === 'setDelay') delay.value = Number(cmd.value)
       else if (cmd.action === 'setDelayEnabled') delayEnabled.value = !!cmd.value
       else if (cmd.action === 'setTrack') trackMode.value = cmd.value
+      else if (cmd.action === 'setPitch') pitchSemitones.value = Number(cmd.value) || 0
+      else if (cmd.action === 'setPitchEnabled') pitchEnabled.value = !!cmd.value
       else if (cmd.action === 'setVolume') {
         const val = Number(cmd.value)
         const t = cmd.target
@@ -376,6 +417,19 @@ const updateDelay = (val) => {
   delay.value = val
   saveState('delay', val)
   sendAction('setDelay', delay.value)
+}
+
+const updatePitch = (val) => {
+  const next = Math.max(-6, Math.min(6, Number(val) || 0))
+  pitchSemitones.value = next
+  saveState('pitchSemitones', next)
+  sendAction('setPitch', next)
+}
+
+const togglePitch = () => {
+  pitchEnabled.value = !pitchEnabled.value
+  saveState('pitchEnabled', pitchEnabled.value ? '1' : '0')
+  sendAction('setPitchEnabled', pitchEnabled.value)
 }
 
 const updateVol = (target, val) => {
@@ -613,17 +667,7 @@ const queueFromSearch = async (item) => {
 }
 
 onMounted(async () => {
-  try {
-    const res = await axios.get(`${API_BASE}/state`)
-    const s = res.data
-    if (s.trackMode) trackMode.value = s.trackMode
-    if (s.delay) delay.value = Number(s.delay)
-    if (s.delayEnabled !== undefined) delayEnabled.value = s.delayEnabled === '1' || s.delayEnabled === 'true'
-    if (s.volOrigSolo) volOrigSolo.value = Number(s.volOrigSolo)
-    if (s.volInstSolo) volInstSolo.value = Number(s.volInstSolo)
-    if (s.volOrigMix) volOrigMix.value = Number(s.volOrigMix)
-    if (s.volInstMix) volInstMix.value = Number(s.volInstMix)
-  } catch (e) {}
+  await refreshControlState()
 
   fetchSongs()
   refreshInterval = setInterval(fetchSongs, 2000)
@@ -680,6 +724,22 @@ onUnmounted(() => {
   padding: 0;
 }
 .step-val { flex: 1; min-width: 38px; text-align: center; background: #1a1a1a; border-radius: 10px; padding: 12px 0; font-size: 18px; font-weight: 700; }
+.pitch-toggle {
+  width: 100%;
+  margin-top: 8px;
+  padding: 12px;
+  border: none;
+  border-radius: 10px;
+  background: #3b3b3b;
+  color: #bdbdbd;
+  font-size: 16px;
+  font-weight: 700;
+}
+.pitch-toggle.active {
+  background: #4e7dff;
+  color: #fff;
+  box-shadow: 0 0 12px rgba(78, 125, 255, 0.45);
+}
 
 .search-page { height: calc(100vh - 170px); display: flex; flex-direction: column; }
 .notice-bar {

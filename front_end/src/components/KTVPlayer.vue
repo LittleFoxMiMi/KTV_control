@@ -65,10 +65,9 @@
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import Plyr from 'plyr'
 import axios from 'axios'
-
-// API Base
-const getHost = () => window.location.hostname
-const API_BASE = `http://${getHost()}:8000`
+import { AudioEngine } from '../audio/AudioEngine.js'
+import { hardAlignTracks, seekMedia, syncFollowerToMaster } from '../audio/audioSync.js'
+import { API_BASE } from '../network.js'
 
 const props = defineProps({
     videoSrc: String,
@@ -87,10 +86,7 @@ const player = ref(null)
 const needsGesture = ref(false)
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-const SYNC_CHECK_INTERVAL_MS = isMobile ? 500 : 350
-const SOFT_SYNC_MIN_DRIFT = 0.015
-const SOFT_SYNC_MAX_RATE_DELTA = 0.03
-const PAIR_HARD_SEEK_THRESHOLD = isMobile ? 0.12 : 0.09
+const SYNC_CHECK_INTERVAL_MS = isMobile ? 100 : 70
 const VIDEO_LOOSE_SYNC_THRESHOLD = isMobile ? 0.35 : 0.25
 const PREROLL_VOLUME = 0.001
 
@@ -103,6 +99,8 @@ const trackMode = ref('original')
 const delay = ref(0) // Will be overwritten by loadSettings
 const delayEnabled = ref(true)
 const effectiveDelay = computed(() => (delayEnabled.value ? delay.value : 0))
+const pitchSemitones = ref(0)
+const pitchEnabled = ref(false)
 
 // Detailed Volume Memory
 const volOrigSolo = ref(100)
@@ -114,6 +112,7 @@ let syncInterval = null
 let sourceChangeToken = 0
 let waitingDelayGate = false
 let delayBootstrapTimer = null
+let audioEngine = null
 
 const stopDelayBootstrapTimer = () => {
     if (delayBootstrapTimer !== null) {
@@ -123,6 +122,10 @@ const stopDelayBootstrapTimer = () => {
 }
 
 const applyPrerollVolumes = () => {
+    if (audioEngine) {
+        audioEngine.setTrackGains(PREROLL_VOLUME, PREROLL_VOLUME, true)
+        return
+    }
     if (origAudioRef.value) {
         origAudioRef.value.muted = false
         origAudioRef.value.volume = PREROLL_VOLUME
@@ -181,8 +184,11 @@ const loadSettings = async () => {
         if(s.volInstSolo) volInstSolo.value = Number(s.volInstSolo)
         if(s.volOrigMix) volOrigMix.value = Number(s.volOrigMix)
         if(s.volInstMix) volInstMix.value = Number(s.volInstMix)
+        if(s.pitchSemitones !== undefined) pitchSemitones.value = Number(s.pitchSemitones)
+        if(s.pitchEnabled !== undefined) pitchEnabled.value = s.pitchEnabled === '1' || s.pitchEnabled === 'true'
         
         applyTrackMode()
+        applyPitch()
         return // Success, skip local
     } catch(e) {
         console.log("State load failed, falling back to local", e)
@@ -206,6 +212,15 @@ const loadSettings = async () => {
     
     const sVolInstMix = localStorage.getItem('ktv_vol_inst_mix')
     if(sVolInstMix !== null) volInstMix.value = Number(sVolInstMix)
+
+    const sPitch = localStorage.getItem('ktv_pitch_semitones')
+    if(sPitch !== null) pitchSemitones.value = Number(sPitch)
+
+    const sPitchEnabled = localStorage.getItem('ktv_pitch_enabled')
+    if(sPitchEnabled !== null) pitchEnabled.value = sPitchEnabled === '1'
+
+    applyTrackMode()
+    applyPitch()
 }
 
 // Watch and Save
@@ -215,16 +230,13 @@ watch(volOrigSolo, (n) => localStorage.setItem('ktv_vol_orig_solo', n))
 watch(volInstSolo, (n) => localStorage.setItem('ktv_vol_inst_solo', n))
 watch(volOrigMix, (n) => localStorage.setItem('ktv_vol_orig_mix', n))
 watch(volInstMix, (n) => localStorage.setItem('ktv_vol_inst_mix', n))
+watch(pitchSemitones, (n) => localStorage.setItem('ktv_pitch_semitones', n))
+watch(pitchEnabled, (n) => localStorage.setItem('ktv_pitch_enabled', n ? '1' : '0'))
 
 
 const seekTo = (el, time) => {
-    if (!el) return
-    const safeTime = time < 0 ? 0 : time
-    if (typeof el.fastSeek === 'function') el.fastSeek(safeTime)
-    else el.currentTime = safeTime
+    seekMedia(el, time)
 }
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
 const applyPlaybackState = (audioEl) => {
     if (!audioEl || !videoRef.value) return
@@ -235,26 +247,6 @@ const applyPlaybackState = (audioEl) => {
     }
 }
 
-const applySoftRateSync = (audioEl, targetTime, baseRate = null) => {
-    if (!audioEl || !videoRef.value) return 0
-
-    const drift = targetTime - audioEl.currentTime
-    const absDrift = Math.abs(drift)
-    const refRate = baseRate ?? videoRef.value.playbackRate
-
-    if (absDrift <= SOFT_SYNC_MIN_DRIFT || videoRef.value.paused) {
-        if (Math.abs(audioEl.playbackRate - refRate) > 0.003) {
-            audioEl.playbackRate = refRate
-        }
-        return absDrift
-    }
-
-    const desiredDelta = clamp(absDrift * 0.18, 0.004, SOFT_SYNC_MAX_RATE_DELTA)
-    const nextRate = drift > 0 ? refRate + desiredDelta : refRate - desiredDelta
-    audioEl.playbackRate = clamp(nextRate, 0.96, 1.04)
-    return absDrift
-}
-
 const immediateDelayCutover = (restoreVolumes = true) => {
     if (!videoRef.value) return
 
@@ -262,14 +254,7 @@ const immediateDelayCutover = (restoreVolumes = true) => {
     const targetTime = Math.max(0, rawTargetTime)
     const baseRate = videoRef.value.playbackRate
 
-    if (origAudioRef.value) {
-        seekTo(origAudioRef.value, targetTime)
-        origAudioRef.value.playbackRate = baseRate
-    }
-    if (instAudioRef.value) {
-        seekTo(instAudioRef.value, targetTime)
-        instAudioRef.value.playbackRate = baseRate
-    }
+    hardAlignTracks(origAudioRef.value, instAudioRef.value, targetTime, baseRate)
 
     waitingDelayGate = false
 
@@ -309,36 +294,13 @@ const syncAudio = () => {
     applyPlaybackState(origAudioRef.value)
     applyPlaybackState(instAudioRef.value)
 
-    // 1) 先做音轨间同步（优先目标）
-    if (origAudioRef.value && instAudioRef.value) {
-        const pairDrift = instAudioRef.value.currentTime - origAudioRef.value.currentTime
-        const absPairDrift = Math.abs(pairDrift)
+    // 原唱是固定主时钟，只有伴奏会进行速率纠偏。
+    if (origAudioRef.value) origAudioRef.value.playbackRate = baseRate
+    syncFollowerToMaster(origAudioRef.value, instAudioRef.value, baseRate)
 
-        if (absPairDrift > PAIR_HARD_SEEK_THRESHOLD) {
-            // 仅对音轨间大偏差做一次切位，不暂停
-            seekTo(instAudioRef.value, origAudioRef.value.currentTime)
-            instAudioRef.value.playbackRate = baseRate
-        } else {
-            // 细同步：让伴奏贴近人声，速率变化尽量轻
-            applySoftRateSync(instAudioRef.value, origAudioRef.value.currentTime, baseRate)
-            if (Math.abs(origAudioRef.value.playbackRate - baseRate) > 0.003) {
-                origAudioRef.value.playbackRate = baseRate
-            }
-        }
-    } else {
-        // 单轨兜底
-        applySoftRateSync(origAudioRef.value, safeTargetTime, baseRate)
-        applySoftRateSync(instAudioRef.value, safeTargetTime, baseRate)
-    }
-
-    // 2) 再做与视频的宽松约束（不追求严格对齐）
+    // 视频只做宽松约束；一旦校正视频偏差，两条音轨同时切位。
     if (origAudioRef.value && Math.abs(origAudioRef.value.currentTime - safeTargetTime) > VIDEO_LOOSE_SYNC_THRESHOLD) {
-        seekTo(origAudioRef.value, safeTargetTime)
-        origAudioRef.value.playbackRate = baseRate
-    }
-    if (instAudioRef.value && Math.abs(instAudioRef.value.currentTime - safeTargetTime) > VIDEO_LOOSE_SYNC_THRESHOLD) {
-        seekTo(instAudioRef.value, safeTargetTime)
-        instAudioRef.value.playbackRate = baseRate
+        hardAlignTracks(origAudioRef.value, instAudioRef.value, safeTargetTime, baseRate)
     }
 }
 
@@ -393,6 +355,10 @@ const onDelayInput = () => { immediateDelayCutover() }
 
 const updateVolume = () => { applyTrackMode() }
 
+const applyPitch = () => {
+    audioEngine?.setPitch(pitchSemitones.value, pitchEnabled.value)
+}
+
 const isAutoplayBlocked = (err) => {
     const name = err?.name || ''
     return name === 'NotAllowedError' || name === 'NotSupportedError' || /NotAllowedError/i.test(String(err))
@@ -421,7 +387,17 @@ const pauseAll = () => {
 
 const unlockAudio = async () => {
     needsGesture.value = false
+    try {
+        await audioEngine?.resume()
+    } catch (e) {
+        needsGesture.value = true
+        return
+    }
     await tryPlay(videoRef.value, true)
+    await Promise.all([
+        tryPlay(origAudioRef.value, true),
+        tryPlay(instAudioRef.value, true)
+    ])
     syncAudio()
 }
 
@@ -473,6 +449,22 @@ const applyTrackMode = () => {
     
     // Video always Muted
     videoRef.value.muted = true
+
+    let originalGain = PREROLL_VOLUME
+    let instrumentalGain = PREROLL_VOLUME
+    if (trackMode.value === 'original') {
+        originalGain = volOrigSolo.value / 100
+    } else if (trackMode.value === 'instrumental') {
+        instrumentalGain = volInstSolo.value / 100
+    } else if (trackMode.value === 'mix') {
+        originalGain = volOrigMix.value / 100
+        instrumentalGain = volInstMix.value / 100
+    }
+
+    if (audioEngine) {
+        audioEngine.setTrackGains(originalGain, instrumentalGain)
+        return
+    }
     
     if (trackMode.value === 'original') {
         if(origAudioRef.value) {
@@ -508,7 +500,17 @@ const applyTrackMode = () => {
     }
 }
 
-onMounted(() => {
+onMounted(async () => {
+    try {
+        audioEngine = new AudioEngine(origAudioRef.value, instAudioRef.value)
+        await audioEngine.init()
+        applyPitch()
+        applyTrackMode()
+    } catch (e) {
+        console.error('High-quality pitch shift unavailable; using original media output', e)
+        audioEngine = null
+    }
+
     loadSettings()
 
     player.value = new Plyr(videoRef.value, {
@@ -530,8 +532,20 @@ onMounted(() => {
     
     const v = videoRef.value
     // Ensure all start together
-    const playAll = () => {
+    const playAll = async () => {
         if (needsGesture.value) {
+            pauseAll()
+            return
+        }
+        try {
+            const running = await audioEngine?.resume()
+            if (audioEngine && !running) {
+                needsGesture.value = true
+                pauseAll()
+                return
+            }
+        } catch (e) {
+            needsGesture.value = true
             pauseAll()
             return
         }
@@ -540,8 +554,10 @@ onMounted(() => {
             } else {
                 syncAudio()
             }
-        tryPlay(origAudioRef.value)
-        tryPlay(instAudioRef.value)
+        await Promise.all([
+            tryPlay(origAudioRef.value, true),
+            tryPlay(instAudioRef.value, true)
+        ])
     }
     if(v) {
         v.addEventListener('play', playAll)
@@ -585,6 +601,8 @@ onUnmounted(() => {
     stopDelayBootstrapTimer()
     if (syncInterval) clearInterval(syncInterval)
     if (player.value) player.value.destroy()
+    if (audioEngine) audioEngine.dispose()
+    audioEngine = null
 })
 
 defineExpose({
@@ -600,6 +618,16 @@ defineExpose({
         if(target === 'volOrigMix') volOrigMix.value = Number(val)
         if(target === 'volInstMix') volInstMix.value = Number(val)
         applyTrackMode()
+    },
+    setPitch: (val) => {
+        pitchSemitones.value = Number(val)
+        applyPitch()
+        syncAudio()
+    },
+    setPitchEnabled: (val) => {
+        pitchEnabled.value = !!val
+        applyPitch()
+        syncAudio()
     },
     togglePlay: () => {
         if(player.value) player.value.togglePlay()

@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import asyncio
 import json
 import os
 import uvicorn
@@ -23,9 +25,10 @@ from src.tasks import (
 from src.music_dl import MusicDLService
 
 # Load Config
-CONFIG_PATH = "config.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "r") as f:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 else:
     config = {}
@@ -130,6 +133,11 @@ app.add_middleware(
 songs_dir = config.get("paths", {}).get("songs_dir", "./songs")
 os.makedirs(songs_dir, exist_ok=True)
 app.mount("/songs", StaticFiles(directory=songs_dir), name="songs")
+
+frontend_dist_dir = os.path.join(BASE_DIR, "front_end", "dist")
+frontend_assets_dir = os.path.join(frontend_dist_dir, "assets")
+if os.path.isdir(frontend_assets_dir):
+    app.mount("/assets", StaticFiles(directory=frontend_assets_dir), name="frontend-assets")
 
 class SongRequest(BaseModel):
     url: str
@@ -255,7 +263,7 @@ async def websocket_endpoint(websocket: WebSocket, client_type: str):
     except WebSocketDisconnect:
         manager.disconnect(websocket, client_type)
 
-@app.get("/")
+@app.get("/api/status")
 def read_root():
     return {"status": "online", "system": "KTV Control Backend", "worker_hint": "Run 'huey_consumer.py src.tasks.huey' to start task processor"}
 
@@ -724,6 +732,75 @@ def update_state(update: StateUpdate):
     db.set_setting(update.key, update.value)
     return {"status": "ok"}
 
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_frontend(full_path: str):
+    """Serve Vite assets and fall back to index.html for Vue history routes."""
+    if not os.path.isdir(frontend_dist_dir):
+        raise HTTPException(status_code=503, detail="Frontend build not found. Run npm run build in front_end.")
+
+    requested_path = os.path.abspath(os.path.join(frontend_dist_dir, full_path))
+    dist_root = os.path.abspath(frontend_dist_dir)
+    if requested_path.startswith(dist_root + os.sep) and os.path.isfile(requested_path):
+        return FileResponse(requested_path)
+
+    index_path = os.path.join(frontend_dist_dir, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=503, detail="Frontend index.html not found")
+
+
+def _resolve_config_path(path_value: str) -> str:
+    if not path_value:
+        return ""
+    if os.path.isabs(path_value):
+        return path_value
+    return os.path.abspath(os.path.join(BASE_DIR, path_value))
+
+
+async def _serve_configured_endpoints():
+    system_config = config.get("system", {})
+    host = system_config.get("host", "0.0.0.0")
+    http_port = int(system_config.get("port", 8000))
+    https_port = int(system_config.get("https_port", 8443))
+    public_hostname = system_config.get("public_hostname", "")
+    certfile = _resolve_config_path(system_config.get("ssl_certfile", ""))
+    keyfile = _resolve_config_path(system_config.get("ssl_keyfile", ""))
+
+    server_configs = [
+        uvicorn.Config(
+            app,
+            host=host,
+            port=http_port,
+            timeout_graceful_shutdown=1,
+            log_level="info",
+        )
+    ]
+
+    if certfile and keyfile and os.path.isfile(certfile) and os.path.isfile(keyfile):
+        server_configs.append(
+            uvicorn.Config(
+                app,
+                host=host,
+                port=https_port,
+                ssl_certfile=certfile,
+                ssl_keyfile=keyfile,
+                timeout_graceful_shutdown=1,
+                log_level="info",
+            )
+        )
+    else:
+        print("WARNING: HTTPS disabled because ssl_certfile or ssl_keyfile is missing.")
+
+    print(f"HTTP frontend/API:  http://localhost:{http_port}")
+    print(f"HTTP frontend/API:  http://127.0.0.1:{http_port}")
+    if len(server_configs) > 1:
+        https_host = public_hostname or "localhost"
+        print(f"HTTPS frontend/API: https://{https_host}:{https_port}")
+
+    servers = [uvicorn.Server(server_config) for server_config in server_configs]
+    await asyncio.gather(*(server.serve() for server in servers))
+
 if __name__ == "__main__":
     print("----------------------------------------------------------------")
     print("Starting KTV Backend API")
@@ -732,10 +809,7 @@ if __name__ == "__main__":
     print("   .\\python\\python.exe worker.py")
     print("----------------------------------------------------------------")
     
-    host = config.get("system", {}).get("host", "0.0.0.0")
-    port = config.get("system", {}).get("port", 8000)
-    # Fix for stuck shutdown on Windows
     try:
-        uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=1)
+        asyncio.run(_serve_configured_endpoints())
     except KeyboardInterrupt:
         pass
