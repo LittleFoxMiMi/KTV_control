@@ -6,6 +6,7 @@ import traceback
 import time
 import sys
 import multiprocessing as mp
+import shutil
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from queue import Empty
 from huey import SqliteHuey
@@ -50,6 +51,81 @@ DEFAULT_MUSIC_COOKIE_FILE_MAP = {
 
 ALL_SOURCES_PROGRESS_RE = re.compile(r'ALL\s+sources.*?\((\d+)\s*/\s*(\d+)\)', re.IGNORECASE)
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+VIDEO_EXTENSIONS = ('.mp4', '.webm', '.mkv')
+MAX_VIDEO_SIZE_BYTES = 200 * 1000 * 1000
+
+
+def _display_resolution(format_info: dict):
+    width = format_info.get('width')
+    height = format_info.get('height')
+    if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return int(min(width, height))
+
+
+def _format_size_bytes(format_info: dict):
+    size = format_info.get('filesize')
+    if not isinstance(size, (int, float)) or size <= 0:
+        size = format_info.get('filesize_approx')
+    if not isinstance(size, (int, float)) or size <= 0:
+        return None
+    return int(size)
+
+
+def _select_bilibili_video_formats(formats: list):
+    """Keep yt-dlp's ordering while limiting retries to 1080p and 720p."""
+    video_formats = [
+        item for item in reversed(formats or [])
+        if item.get('format_id')
+        and item.get('vcodec') not in (None, 'none')
+        and item.get('acodec') in (None, 'none')
+    ]
+    formats_1080 = [item for item in video_formats if _display_resolution(item) == 1080]
+    formats_720 = [item for item in video_formats if _display_resolution(item) == 720]
+
+    candidates = formats_1080[:2]
+    if formats_720:
+        candidates.append(formats_720[0])
+    if not candidates and video_formats:
+        candidates.append(video_formats[0])
+    return candidates
+
+
+def _select_best_audio_format(formats: list):
+    for item in reversed(formats or []):
+        if (item.get('format_id')
+                and item.get('vcodec') in (None, 'none')
+                and item.get('acodec') not in (None, 'none')):
+            return item
+    return None
+
+
+def _validate_media_file(file_path: str):
+    ffmpeg_path = config['paths'].get('ffmpeg_path', 'ffmpeg')
+    result = subprocess.run(
+        [ffmpeg_path, '-v', 'error', '-i', file_path, '-map', '0',
+         '-c', 'copy', '-f', 'null', '-'],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
+    errors = (result.stderr or '').strip()
+    return result.returncode == 0 and not errors, errors
+
+
+def _remove_files_with_prefix(directory: str, prefix: str):
+    if not os.path.isdir(directory):
+        return
+    for filename in os.listdir(directory):
+        if filename.startswith(prefix):
+            try:
+                os.remove(os.path.join(directory, filename))
+            except OSError:
+                pass
 
 
 def _parse_all_sources_progress(line: str):
@@ -657,22 +733,18 @@ def process_song_task(song_id: int):
         try:
             cookies_path = os.path.join("cookies", "cookies.txt")
             cookies_arg = ['--cookies', cookies_path] if os.path.exists(cookies_path) else []
+            is_bilibili_url = 'bilibili' in song['url'] or 'b23.tv' in song['url']
+            playlist_args = [] if is_bilibili_url else ['--playlist-items', '1', '--no-playlist']
             res = subprocess.run(
-                [yt_dlp_path, song['url'], '-j', '--playlist-items', '1', '--no-playlist', '--add-header', 'Origin:https://www.bilibili.com', '--add-header', 'Referer:https://www.bilibili.com','--concurrent-fragments', '1'] + cookies_arg,
+                [yt_dlp_path, song['url'], '-j'] + playlist_args + ['--add-header', 'Origin:https://www.bilibili.com', '--add-header', 'Referer:https://www.bilibili.com', '--concurrent-fragments', '1'] + cookies_arg,
                 capture_output=True, text=True, encoding='utf-8', errors='ignore'
             )
             if res.returncode == 0 and res.stdout:
                 meta = json.loads(res.stdout.split('\n')[0])
                 video_id = meta.get('id')
                 video_title = meta.get('title')
-                 
-                 # Bilibili ID Consistency Fix: 
-                 # Short links resolve to 'BV..._p1', Long links to 'BV...'.
-                 # Enforce '_p1' suffix if missing so they match in Library.
-                if video_id and video_id.startswith('BV') and not re.search(r'_p\d+$', video_id):
-                    video_id += '_p1'
-                 
-                 # Save to DB immediately
+
+                # yt-dlp includes the part suffix in id when the shared URL points to a part.
                 db.update_paths(song_id, video_id=video_id, title=video_title)
             else:
                 err_msg = (res.stderr or res.stdout or "(no output)").strip()
@@ -702,20 +774,41 @@ def process_song_task(song_id: int):
             full_video = os.path.join(songs_dir, lib_entry['video_path']) if lib_entry['video_path'] else None
             full_inst = os.path.join(songs_dir, lib_entry['audio_path']) if lib_entry['audio_path'] else None
             
-            # We strictly require Video and Instrumental for a "Hit"
+            # We strictly require a valid Video and Instrumental for a "Hit"
             if full_video and os.path.exists(full_video) and full_inst and os.path.exists(full_inst):
-                 print(f"Library hit confirmed for {video_id}.")
-                 db.update_paths(song_id, 
-                                 video_id=video_id,
-                                 title=lib_entry['title'] or video_title,
-                                 video_path=lib_entry['video_path'], 
-                                 audio_path=lib_entry['audio_path'], 
-                                 raw_audio_path=lib_entry['raw_audio_path'])
-                 db.update_status(song_id, "completed", 100, status_detail="Restored from Library")
-                 
-                 # Update 'last_used' in library
-                 db.save_to_library(video_id, lib_entry['title'] or video_title, lib_entry['video_path'], lib_entry['audio_path'], lib_entry['raw_audio_path'], platform)
-                 return
+                 db.update_status(song_id, "processing", 0, status_detail="Validating library video...")
+                 try:
+                     valid_video, validation_error = _validate_media_file(full_video)
+                 except OSError as exc:
+                     db.update_status(
+                         song_id,
+                         "error",
+                         0,
+                         error_msg=str(exc),
+                         status_detail="ffmpeg validation could not start",
+                     )
+                     return
+                 if not valid_video:
+                     print(f"Invalid library video for {video_id}: {validation_error}")
+                     try:
+                         os.remove(full_video)
+                     except OSError:
+                         pass
+                     db.delete_mv_library_song(video_id)
+                     db.clear_media_paths(song_id)
+                 else:
+                     print(f"Library hit confirmed for {video_id}.")
+                     db.update_paths(song_id,
+                                     video_id=video_id,
+                                     title=lib_entry['title'] or video_title,
+                                     video_path=lib_entry['video_path'],
+                                     audio_path=lib_entry['audio_path'],
+                                     raw_audio_path=lib_entry['raw_audio_path'])
+                     db.update_status(song_id, "completed", 100, status_detail="Restored from Library")
+
+                     # Update 'last_used' in library
+                     db.save_to_library(video_id, lib_entry['title'] or video_title, lib_entry['video_path'], lib_entry['audio_path'], lib_entry['raw_audio_path'], platform)
+                     return
 
     download_song_task(song_id)
 
@@ -762,77 +855,213 @@ def download_song_task(song_id: int):
             should_download = True
             if os.path.exists(target_dir):
                 existing_files = os.listdir(target_dir)
-                has_video = any(f.startswith(video_id) and not 'instrumental' in f and f.lower().endswith(('.mp4','.webm','.mkv')) for f in existing_files)
+                video_files = [
+                    f for f in existing_files
+                    if f.startswith(video_id)
+                    and 'instrumental' not in f
+                    and f.lower().endswith(VIDEO_EXTENSIONS)
+                ]
+                has_video = bool(video_files)
                 has_inst = any('instrumental' in f for f in existing_files)
 
                 if has_video and has_inst:
-                    print(f"Files found for {video_id}, skipping download.")
-                    should_download = False
+                    video_path = os.path.join(target_dir, video_files[0])
+                    db.update_status(song_id, "processing", 0, status_detail="Validating existing video...")
+                    valid_video, validation_error = _validate_media_file(video_path)
+                    if valid_video:
+                        print(f"Valid files found for {video_id}, skipping download.")
+                        inst_files = [os.path.join(target_dir, f) for f in existing_files if 'instrumental' in f]
+                        audio_inst = inst_files[0]
+                        raw_files = [
+                            os.path.join(target_dir, f) for f in existing_files
+                            if f.startswith(video_id) and f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))
+                        ]
+                        audio_raw = raw_files[0] if raw_files else video_path
 
-                    candidates = [os.path.join(target_dir, f) for f in existing_files if f.startswith(video_id) and not 'instrumental' in f]
-                    video_path = candidates[0] if candidates else None
+                        db.update_paths(
+                            song_id,
+                            video_path=os.path.relpath(video_path, songs_dir),
+                            audio_path=os.path.relpath(audio_inst, songs_dir),
+                            raw_audio_path=os.path.relpath(audio_raw, songs_dir),
+                        )
+                        db.update_status(song_id, "completed", 100, status_detail="Ready")
+                        return
 
-                    inst_files = [os.path.join(target_dir, f) for f in existing_files if 'instrumental' in f]
-                    audio_inst = inst_files[0] if inst_files else None
-
-                    audio_raw = video_path
-
-                    rel_v = os.path.relpath(video_path, songs_dir)
-                    rel_i = os.path.relpath(audio_inst, songs_dir)
-                    rel_r = os.path.relpath(audio_raw, songs_dir)
-
-                    db.update_paths(song_id, video_path=rel_v, audio_path=rel_i, raw_audio_path=rel_r)
-                    db.update_status(song_id, "completed", 100, status_detail="Ready")
-                    return
+                    print(f"Invalid existing video for {video_id}: {validation_error}")
+                    for filename in video_files:
+                        try:
+                            os.remove(os.path.join(target_dir, filename))
+                        except OSError:
+                            pass
+                    db.clear_media_paths(song_id)
 
             if should_download:
-                db.update_status(song_id, "downloading", 0, status_detail="Downloading")
-
                 cookies_path = os.path.join("cookies", "cookies.txt")
                 cookies_arg = ['--cookies', cookies_path] if os.path.exists(cookies_path) else []
 
-                out_tmpl = os.path.join(target_dir, f"{video_id}.%(ext)s")
-                cmd = [
-                    config['paths'].get('yt_dlp_path', 'yt-dlp'),
-                    song['url'],
-                    '-f', 'bestvideo,bestaudio',
-                    '-o', out_tmpl,
-                    '--no-playlist'
-                ] + cookies_arg
+                if platform == 'bilibili':
+                    yt_dlp_path = config['paths'].get('yt_dlp_path', 'yt-dlp')
+                    info_cmd = [
+                        yt_dlp_path, song['url'], '-j',
+                        '--add-header', 'Origin:https://www.bilibili.com',
+                        '--add-header', 'Referer:https://www.bilibili.com',
+                        '--concurrent-fragments', '1',
+                    ] + cookies_arg
+                    info_result = subprocess.run(
+                        info_cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                    )
+                    if info_result.returncode != 0 or not info_result.stdout.strip():
+                        error_text = (info_result.stderr or info_result.stdout or 'no output').strip()
+                        raise RuntimeError(f"Failed to resolve download formats: {error_text}")
 
-                ret = run_command_with_progress(cmd, song_id, dl_progress_parser, status_prefix="Downloading")
-                if ret != 0:
-                    db.update_status(song_id, "error", 0, error_msg="Download Failed", status_detail="Download Failed")
-                    return
+                    metadata = json.loads(next(line for line in info_result.stdout.splitlines() if line.strip()))
+                    formats = metadata.get('formats') or []
+                    video_candidates = _select_bilibili_video_formats(formats)
+                    audio_format = _select_best_audio_format(formats)
+                    if not video_candidates:
+                        raise RuntimeError("No downloadable video format found")
+                    if not audio_format:
+                        raise RuntimeError("No downloadable audio format found")
 
-                video_files = [f for f in os.listdir(target_dir) if f.startswith(video_id) and f.endswith('.mp4')]
-                audio_files = [f for f in os.listdir(target_dir) if f.startswith(video_id) and f.endswith('.m4a')]
+                    staging_dir = os.path.join(target_dir, '.download')
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    os.makedirs(staging_dir, exist_ok=True)
+                    out_tmpl = os.path.join(staging_dir, f"{video_id}.%(format_id)s.%(ext)s")
+                    last_error = 'Download failed'
 
-                if not video_files:
-                    db.update_status(song_id, "error", error_msg="Video file missing", status_detail="Video file missing")
-                    return
+                    for attempt, video_format in enumerate(video_candidates, start=1):
+                        format_id = str(video_format['format_id'])
+                        resolution = _display_resolution(video_format)
+                        attempt_count = len(video_candidates)
+                        estimated_size = _format_size_bytes(video_format)
+                        if estimated_size and estimated_size > MAX_VIDEO_SIZE_BYTES:
+                            size_mb = estimated_size / 1000 / 1000
+                            last_error = f"Format {format_id} is too large ({size_mb:.1f} MB > 200 MB)"
+                            shutil.rmtree(staging_dir, ignore_errors=True)
+                            db.clear_media_paths(song_id)
+                            db.update_status(
+                                song_id,
+                                "error",
+                                0,
+                                error_msg=last_error,
+                                status_detail="Video rejected: estimated size exceeds 200 MB",
+                            )
+                            return
+                        action = "Downloading" if attempt == 1 else "Retrying"
+                        status_detail = f"{action} {resolution}p (attempt {attempt}/{attempt_count}, format {format_id})"
+                        db.update_status(song_id, "downloading", 0, status_detail=status_detail)
 
-                video_filename = video_files[0]
-                full_video_path = os.path.join(target_dir, video_filename)
+                        cmd = [
+                            yt_dlp_path,
+                            song['url'],
+                            '-f', f"{format_id},{audio_format['format_id']}",
+                            '-o', out_tmpl,
+                        ] + cookies_arg
+                        ret = run_command_with_progress(
+                            cmd, song_id, dl_progress_parser, status_prefix=status_detail
+                        )
 
-                if audio_files:
-                    audio_raw_filename = audio_files[0]
-                    full_audio_raw_path = os.path.join(target_dir, audio_raw_filename)
+                        video_prefix = f"{video_id}.{format_id}."
+                        downloaded_videos = [
+                            os.path.join(staging_dir, filename)
+                            for filename in os.listdir(staging_dir)
+                            if filename.startswith(video_prefix)
+                            and filename.lower().endswith(VIDEO_EXTENSIONS)
+                        ]
+                        if ret != 0 or not downloaded_videos:
+                            last_error = f"Format {format_id} download failed"
+                            _remove_files_with_prefix(staging_dir, video_prefix)
+                            continue
+
+                        downloaded_video = downloaded_videos[0]
+                        db.update_status(
+                            song_id,
+                            "processing",
+                            100,
+                            status_detail=f"Validating {resolution}p (attempt {attempt}/{attempt_count})",
+                        )
+                        valid_video, validation_error = _validate_media_file(downloaded_video)
+                        if not valid_video:
+                            last_error = f"Format {format_id} validation failed: {validation_error}"
+                            print(last_error)
+                            _remove_files_with_prefix(staging_dir, video_prefix)
+                            continue
+
+                        audio_prefix = f"{video_id}.{audio_format['format_id']}."
+                        downloaded_audio = [
+                            os.path.join(staging_dir, filename)
+                            for filename in os.listdir(staging_dir)
+                            if filename.startswith(audio_prefix)
+                            and not filename.endswith(('.part', '.ytdl'))
+                        ]
+                        if not downloaded_audio:
+                            last_error = f"Audio format {audio_format['format_id']} is missing"
+                            _remove_files_with_prefix(staging_dir, video_prefix)
+                            continue
+
+                        video_ext = os.path.splitext(downloaded_video)[1].lower()
+                        audio_ext = os.path.splitext(downloaded_audio[0])[1].lower()
+                        full_video_path = os.path.join(target_dir, f"{video_id}{video_ext}")
+                        full_audio_raw_path = os.path.join(target_dir, f"{video_id}{audio_ext}")
+                        os.replace(downloaded_video, full_video_path)
+                        os.replace(downloaded_audio[0], full_audio_raw_path)
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+
+                        db.update_paths(
+                            song_id,
+                            video_path=os.path.relpath(full_video_path, songs_dir),
+                            raw_audio_path=os.path.relpath(full_audio_raw_path, songs_dir),
+                        )
+                        break
+                    else:
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+                        db.clear_media_paths(song_id)
+                        db.update_status(
+                            song_id,
+                            "error",
+                            0,
+                            error_msg=last_error,
+                            status_detail="All video download attempts failed",
+                        )
+                        return
                 else:
-                    print("Warning: .m4a file not found, using video file for raw audio")
-                    full_audio_raw_path = full_video_path
+                    db.update_status(song_id, "downloading", 0, status_detail="Downloading")
+                    out_tmpl = os.path.join(target_dir, f"{video_id}.%(ext)s")
+                    cmd = [
+                        config['paths'].get('yt_dlp_path', 'yt-dlp'),
+                        song['url'],
+                        '-f', 'bestvideo,bestaudio',
+                        '-o', out_tmpl,
+                    ] + ['--playlist-items', '1', '--no-playlist'] + cookies_arg
+                    ret = run_command_with_progress(cmd, song_id, dl_progress_parser, status_prefix="Downloading")
+                    if ret != 0:
+                        db.update_status(song_id, "error", 0, error_msg="Download Failed", status_detail="Download Failed")
+                        return
 
-                rel_video_path = os.path.relpath(full_video_path, songs_dir)
-                rel_raw_audio_path = os.path.relpath(full_audio_raw_path, songs_dir)
+                    video_files = [f for f in os.listdir(target_dir) if f.startswith(video_id) and f.lower().endswith(VIDEO_EXTENSIONS)]
+                    audio_files = [f for f in os.listdir(target_dir) if f.startswith(video_id) and f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))]
+                    if not video_files:
+                        db.update_status(song_id, "error", error_msg="Video file missing", status_detail="Video file missing")
+                        return
 
-                db.update_paths(song_id, video_path=rel_video_path, raw_audio_path=rel_raw_audio_path)
+                    full_video_path = os.path.join(target_dir, video_files[0])
+                    full_audio_raw_path = os.path.join(target_dir, audio_files[0]) if audio_files else full_video_path
+                    db.update_paths(
+                        song_id,
+                        video_path=os.path.relpath(full_video_path, songs_dir),
+                        raw_audio_path=os.path.relpath(full_audio_raw_path, songs_dir),
+                    )
 
             separate_song_task(song_id)
 
         except Exception as e:
             print(f"Task Error: {e}")
             traceback.print_exc()
-            db.update_status(song_id, "error", error_msg=str(e))
+            db.update_status(song_id, "error", 0, error_msg=str(e), status_detail=f"Download failed: {e}")
 
 
 @huey.task(queue=QUEUE_SEPARATE)

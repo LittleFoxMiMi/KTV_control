@@ -180,6 +180,7 @@
               {{ song.status }}
               <span v-if="song.status !== 'completed' && song.progress > 0">{{ Math.round(song.progress) }}%</span>
             </div>
+            <div v-if="song.status_detail" class="queue-status-detail">{{ song.status_detail }}</div>
           </div>
           <div class="actions">
             <button class="btn-move" :disabled="index === 0" @click="moveSong(song.id, 'top')">置顶</button>
@@ -878,6 +879,13 @@ onUnmounted(() => {
 }
 .queue-list .title { max-width: 100%; overflow: hidden; white-space: nowrap; }
 .queue-list .title-text { display: inline-block; transform: translateX(0); }
+.queue-status-detail {
+  margin-top: 2px;
+  color: #aaa;
+  font-size: 12px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
 .queue-list .title.is-overflow .title-text { animation: queue-marquee 12s linear infinite; }
 @keyframes queue-marquee {
   0% { transform: translateX(0); }

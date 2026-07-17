@@ -493,6 +493,19 @@ class SongDatabase:
         finally:
             conn.close()
 
+    def clear_media_paths(self, song_id: int):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                UPDATE songs
+                SET video_path = NULL, audio_path = NULL, raw_audio_path = NULL
+                WHERE id = ?
+            ''', (song_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def update_song_media(
         self,
         song_id: int,
