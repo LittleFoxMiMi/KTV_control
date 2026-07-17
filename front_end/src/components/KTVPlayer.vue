@@ -4,6 +4,7 @@
       ref="videoRef"
       class="main-video"
       playsinline
+      muted
       controls
       crossorigin
       :src="videoSrc"
@@ -62,7 +63,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
 import Plyr from 'plyr'
 import axios from 'axios'
 import { AudioEngine } from '../audio/AudioEngine.js'
@@ -110,16 +111,18 @@ const volInstMix = ref(80)
 
 let syncInterval = null
 let sourceChangeToken = 0
+let sourceLoading = false
+let sourceOutputMuted = false
 let audioEngine = null
 
 // Restore settings
 const loadSettings = async () => {
     // 1. Try Server
     try {
-        const res = await axios.get(`${API_BASE}/state`)
+        const res = await axios.get(`${API_BASE}/state`, { timeout: 2000 })
         const s = res.data
         if(s.trackMode) trackMode.value = s.trackMode
-        if(s.delay) delay.value = Number(s.delay)
+        if(s.delay !== undefined) delay.value = Number(s.delay)
         if (s.delayEnabled !== undefined) delayEnabled.value = s.delayEnabled === '1' || s.delayEnabled === 'true'
         if(s.volOrigSolo) volOrigSolo.value = Number(s.volOrigSolo)
         if(s.volInstSolo) volInstSolo.value = Number(s.volInstSolo)
@@ -198,6 +201,30 @@ const holdAudioAtDelayGate = () => {
     }
 }
 
+const muteForSourceChange = () => {
+    const token = ++sourceChangeToken
+    sourceLoading = true
+    sourceOutputMuted = true
+    audioEngine?.setOutputMuted(true)
+
+    for (const audioEl of [origAudioRef.value, instAudioRef.value]) {
+        if (!audioEl) continue
+        audioEl.muted = true
+        if (!audioEl.paused) audioEl.pause()
+    }
+    if (videoRef.value && !videoRef.value.paused) videoRef.value.pause()
+    return token
+}
+
+const releaseSourceMute = () => {
+    if (!sourceOutputMuted) return
+    sourceOutputMuted = false
+    applyTrackMode()
+    if (origAudioRef.value) origAudioRef.value.muted = false
+    if (instAudioRef.value) instAudioRef.value.muted = false
+    audioEngine?.setOutputMuted(false)
+}
+
 const immediateDelayCutover = (restoreVolumes = true) => {
     if (!videoRef.value) return
 
@@ -220,6 +247,7 @@ const immediateDelayCutover = (restoreVolumes = true) => {
 
 const syncAudio = () => {
     if (!videoRef.value) return
+    if (sourceLoading) return
     if (needsGesture.value) {
         pauseAll()
         return
@@ -233,6 +261,7 @@ const syncAudio = () => {
         return
     }
 
+    releaseSourceMute()
     const safeTargetTime = Math.max(0, targetTime)
     const baseRate = videoRef.value.playbackRate
 
@@ -264,9 +293,7 @@ const waitForReady = (el) => new Promise((resolve) => {
     setTimeout(done, 2000)
 })
 
-const syncAfterSourceChange = async () => {
-    const token = ++sourceChangeToken
-    pauseAll()
+const syncAfterSourceChange = async (token) => {
     if (videoRef.value) {
         videoRef.value.currentTime = 0
         videoRef.value.load()
@@ -287,6 +314,7 @@ const syncAfterSourceChange = async () => {
     ])
 
     if (token !== sourceChangeToken) return
+    sourceLoading = false
     syncAudio()
     if (!needsGesture.value) {
         await tryPlay(videoRef.value, true)
@@ -425,8 +453,13 @@ const applyTrackMode = () => {
         }
         if(instAudioRef.value) {
             instAudioRef.value.muted = false
-             instAudioRef.value.volume = volInstMix.value / 100
+            instAudioRef.value.volume = volInstMix.value / 100
         }
+    }
+
+    if (sourceOutputMuted) {
+        if (origAudioRef.value) origAudioRef.value.muted = true
+        if (instAudioRef.value) instAudioRef.value.muted = true
     }
 }
 
@@ -441,7 +474,9 @@ onMounted(async () => {
         audioEngine = null
     }
 
-    loadSettings()
+    // Delay must be known before autoplay; otherwise the initial zero value
+    // briefly starts both audio tracks on every fresh player mount.
+    await loadSettings()
 
     player.value = new Plyr(videoRef.value, {
         controls: ['play-large', 'play', 'progress', 'current-time', 'fullscreen'], 
@@ -514,9 +549,13 @@ onMounted(async () => {
 
 watch(
     () => [props.videoSrc, props.audioSrc, props.originalAudioSrc],
-    () => {
-        syncAfterSourceChange()
-    }
+    async () => {
+        const token = muteForSourceChange()
+        await nextTick()
+        if (token !== sourceChangeToken) return
+        syncAfterSourceChange(token)
+    },
+    { flush: 'sync' }
 )
 
 onUnmounted(() => {

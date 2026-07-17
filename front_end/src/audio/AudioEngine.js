@@ -30,6 +30,8 @@ export class AudioEngine {
     this.dryGain = null
     this.wetGain = null
     this.pitchShift = null
+    this.pitchEnabled = false
+    this.outputMuted = false
     this.initialized = false
     this.initPromise = null
   }
@@ -125,14 +127,29 @@ export class AudioEngine {
     rampGain(this.instrumentalGain, instrumental, duration)
   }
 
+  setOutputMuted(muted) {
+    if (!this.initialized) return
+    this.outputMuted = !!muted
+    const now = this.context.currentTime
+    const dryValue = this.outputMuted || this.pitchEnabled ? 0 : 1
+    const wetValue = this.outputMuted || !this.pitchEnabled ? 0 : 1
+
+    this.dryGain.gain.cancelScheduledValues(now)
+    this.wetGain.gain.cancelScheduledValues(now)
+    this.dryGain.gain.setValueAtTime(dryValue, now)
+    this.wetGain.gain.setValueAtTime(wetValue, now)
+  }
+
   setPitch(semitones, enabled) {
     if (!this.initialized) return
     const value = clamp(Math.round(Number(semitones) || 0), -6, 6)
+    this.pitchEnabled = !!enabled
     const now = this.context.currentTime
     this.pitchShift.pitchSemitones.cancelScheduledValues(now)
     this.pitchShift.pitchSemitones.setValueAtTime(value, now)
-    rampGain(this.dryGain, enabled ? 0 : 1)
-    rampGain(this.wetGain, enabled ? 1 : 0)
+    if (this.outputMuted) return
+    rampGain(this.dryGain, this.pitchEnabled ? 0 : 1)
+    rampGain(this.wetGain, this.pitchEnabled ? 1 : 0)
   }
 
   dispose() {
