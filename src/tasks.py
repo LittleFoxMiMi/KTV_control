@@ -149,6 +149,22 @@ def _select_bilibili_video_formats(formats: list):
     return candidates
 
 
+def _select_youtube_video_formats(formats: list):
+    """Use yt-dlp's ordering and retry at most two video-only formats."""
+    video_formats = [
+        item for item in reversed(formats or [])
+        if item.get('format_id')
+        and item.get('vcodec') not in (None, 'none')
+        and item.get('acodec') in (None, 'none')
+    ]
+    formats_up_to_1080 = [
+        item for item in video_formats
+        if _display_resolution(item) is not None
+        and _display_resolution(item) <= 1080
+    ]
+    return (formats_up_to_1080 or video_formats)[:2]
+
+
 def _select_best_audio_format(formats: list):
     for item in reversed(formats or []):
         if (item.get('format_id')
@@ -156,6 +172,13 @@ def _select_best_audio_format(formats: list):
                 and item.get('acodec') not in (None, 'none')):
             return item
     return None
+
+
+def _media_paths(target_dir: str, video_id: str, video_ext: str, audio_ext: str):
+    return (
+        os.path.join(target_dir, f"{video_id}.video{video_ext}"),
+        os.path.join(target_dir, f"{video_id}.audio{audio_ext}"),
+    )
 
 
 def _validate_media_file(file_path: str):
@@ -960,6 +983,7 @@ def download_song_task(song_id: int):
                     f for f in existing_files
                     if f.startswith(video_id)
                     and 'instrumental' not in f
+                    and '.audio.' not in f.lower()
                     and f.lower().endswith(VIDEO_EXTENSIONS)
                 ]
                 has_video = bool(video_files)
@@ -975,7 +999,11 @@ def download_song_task(song_id: int):
                         audio_inst = inst_files[0]
                         raw_files = [
                             os.path.join(target_dir, f) for f in existing_files
-                            if f.startswith(video_id) and f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))
+                            if f.startswith(video_id)
+                            and (
+                                '.audio.' in f.lower()
+                                or f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))
+                            )
                         ]
                         audio_raw = raw_files[0] if raw_files else video_path
 
@@ -1000,14 +1028,20 @@ def download_song_task(song_id: int):
                 cookies_path = os.path.join("cookies", "cookies.txt")
                 cookies_arg = ['--cookies', cookies_path] if os.path.exists(cookies_path) else []
 
-                if platform == 'bilibili':
+                if platform in ('bilibili', 'youtube'):
                     yt_dlp_path = config['paths'].get('yt_dlp_path', 'yt-dlp')
-                    info_cmd = [
-                        yt_dlp_path, song['url'], '-j',
-                        '--add-header', 'Origin:https://www.bilibili.com',
-                        '--add-header', 'Referer:https://www.bilibili.com',
-                        '--concurrent-fragments', '1',
-                    ] + cookies_arg
+                    if platform == 'bilibili':
+                        info_extra_args = [
+                            '--add-header', 'Origin:https://www.bilibili.com',
+                            '--add-header', 'Referer:https://www.bilibili.com',
+                            '--concurrent-fragments', '1',
+                        ]
+                        download_extra_args = []
+                    else:
+                        info_extra_args = ['--playlist-items', '1', '--no-playlist']
+                        download_extra_args = ['--playlist-items', '1', '--no-playlist']
+
+                    info_cmd = [yt_dlp_path, song['url'], '-j'] + info_extra_args + cookies_arg
                     info_result = subprocess.run(
                         info_cmd,
                         capture_output=True,
@@ -1021,7 +1055,10 @@ def download_song_task(song_id: int):
 
                     metadata = json.loads(next(line for line in info_result.stdout.splitlines() if line.strip()))
                     formats = metadata.get('formats') or []
-                    video_candidates = _select_bilibili_video_formats(formats)
+                    if platform == 'bilibili':
+                        video_candidates = _select_bilibili_video_formats(formats)
+                    else:
+                        video_candidates = _select_youtube_video_formats(formats)
                     audio_format = _select_best_audio_format(formats)
                     if not video_candidates:
                         raise RuntimeError("No downloadable video format found")
@@ -1062,7 +1099,7 @@ def download_song_task(song_id: int):
                             '-f', f"{format_id},{audio_format['format_id']}",
                             '-o', out_tmpl,
                             '--newline',
-                        ] + cookies_arg
+                        ] + download_extra_args + cookies_arg
                         ret = run_command_with_progress(
                             cmd, song_id, dl_progress_parser, status_prefix=status_detail
                         )
@@ -1111,8 +1148,9 @@ def download_song_task(song_id: int):
 
                         video_ext = os.path.splitext(downloaded_video)[1].lower()
                         audio_ext = os.path.splitext(downloaded_audio[0])[1].lower()
-                        full_video_path = os.path.join(target_dir, f"{video_id}{video_ext}")
-                        full_audio_raw_path = os.path.join(target_dir, f"{video_id}{audio_ext}")
+                        full_video_path, full_audio_raw_path = _media_paths(
+                            target_dir, video_id, video_ext, audio_ext
+                        )
                         os.replace(downloaded_video, full_video_path)
                         os.replace(downloaded_audio[0], full_audio_raw_path)
                         shutil.rmtree(staging_dir, ignore_errors=True)
