@@ -416,8 +416,11 @@ class SongDatabase:
             
             # Insert
             cursor.execute('''
-                INSERT INTO songs (url, video_id, title, status, created_at)
-                VALUES (?, ?, ?, 'pending', ?)
+                INSERT INTO songs (url, video_id, title, status, created_at, priority)
+                VALUES (
+                    ?, ?, ?, 'pending', ?,
+                    (SELECT COALESCE(MIN(priority), 1) - 1 FROM songs)
+                )
             ''', (url, video_id, title, time.time()))
             conn.commit()
             return cursor.lastrowid
@@ -712,17 +715,19 @@ class SongDatabase:
             
             idx = next((i for i, s in enumerate(all_songs) if s['id'] == song_id), -1)
             if idx == -1: return False
+            if idx == 0:
+                # The active playback/processing slot is not reorderable.
+                return False
             
             target_idx = -1
-            if direction == 'up' and idx > 0:
+            if direction == 'up' and idx > 1:
                 target_idx = idx - 1
             elif direction == 'down' and idx < len(all_songs) - 1:
                 target_idx = idx + 1
 
             if direction == 'top':
-                # Keep index 0 as active slot (now playing / processing).
-                # 'Top' means top of pending queue, i.e. index 1.
-                if idx <= 1:
+                # Index 0 is the active playback slot; top means the first waiting item.
+                if idx == 1:
                     return False
                 moving = all_songs.pop(idx)
                 all_songs.insert(1, moving)
@@ -767,13 +772,44 @@ class SongDatabase:
         finally:
             conn.close()
 
+    def reorder_waiting_songs(self, song_ids: List[int]) -> bool:
+        """Replace the waiting queue order while keeping the active slot fixed."""
+        requested_ids = [int(song_id) for song_id in song_ids]
+        if len(requested_ids) != len(set(requested_ids)):
+            raise ValueError("duplicate song ids")
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id FROM songs ORDER BY priority DESC, id ASC")
+            current_ids = [int(row['id']) for row in cursor.fetchall()]
+            waiting_ids = current_ids[1:] if current_ids else []
+            if len(requested_ids) != len(waiting_ids) or set(requested_ids) != set(waiting_ids):
+                raise ValueError("queue changed")
+
+            ordered_ids = current_ids[:1] + requested_ids
+            count = len(ordered_ids)
+            for index, song_id in enumerate(ordered_ids):
+                cursor.execute(
+                    "UPDATE songs SET priority = ? WHERE id = ?",
+                    (count - index, song_id),
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def delete_song(self, song_id: int):
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT video_path, audio_path, cover_path, lyric_path FROM songs WHERE id=?", (song_id,))
+        cursor.execute("SELECT video_path, audio_path, raw_audio_path, cover_path, lyric_path FROM songs WHERE id=?", (song_id,))
         row = cursor.fetchone()
         if row:
-            for key in ['video_path', 'audio_path', 'cover_path', 'lyric_path']:
+            for key in ['video_path', 'audio_path', 'raw_audio_path', 'cover_path', 'lyric_path']:
                 path = row[key]
                 if path and os.path.exists(path):
                     try:

@@ -168,7 +168,7 @@
         </div>
       </div>
 
-      <div class="queue-list">
+      <div ref="queueListRef" class="queue-list">
         <div v-for="(song, index) in reversedQueue" :key="song.id" class="queue-item" :data-id="song.id">
           <div class="info">
             <div class="title" :class="{ 'is-overflow': overflowMap[song.id]?.overflow }">
@@ -201,6 +201,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
 import axios from 'axios'
+import Sortable from 'sortablejs'
 import { API_BASE, getWebSocketUrl } from '../network.js'
 
 const WS_BASE = getWebSocketUrl('/ws/remote')
@@ -211,6 +212,7 @@ const newUrl = ref('')
 const loading = ref(false)
 const songs = ref([])
 const overflowMap = ref({})
+const queueListRef = ref(null)
 const searchOverflowMap = ref({})
 const noticeMessage = ref('')
 const noticeType = ref('info')
@@ -245,6 +247,8 @@ let searchPollTimer = null
 
 let ws = null
 let refreshInterval = null
+let queueSortable = null
+let queueBusy = false
 const onResize = () => {
   updateOverflow()
   updateSearchOverflow()
@@ -443,12 +447,54 @@ const updateVol = (target, val) => {
   sendAction('setVolume', v, target)
 }
 
-const fetchSongs = async () => {
+const fetchSongs = async (force = false) => {
+  if (queueBusy && !force) return
   try {
     const res = await axios.get(`${API_BASE}/songs`)
     songs.value = res.data
     nextTick(updateOverflow)
   } catch (e) {}
+}
+
+const initQueueSorting = () => {
+  if (!queueListRef.value || queueSortable) return
+  queueSortable = Sortable.create(queueListRef.value, {
+    animation: 200,
+    delay: 320,
+    delayOnTouchOnly: true,
+    touchStartThreshold: 5,
+    fallbackTolerance: 6,
+    fallbackOnBody: true,
+    swapThreshold: 0.65,
+    scroll: true,
+    scrollSensitivity: 80,
+    scrollSpeed: 12,
+    filter: '.actions, button',
+    preventOnFilter: false,
+    chosenClass: 'queue-item-chosen',
+    ghostClass: 'queue-item-ghost',
+    dragClass: 'queue-item-dragging',
+    onStart: () => {
+      queueBusy = true
+    },
+    onEnd: async () => {
+      const nodes = Array.from(queueListRef.value?.querySelectorAll('.queue-item') || [])
+      const orderedIds = nodes.map((node) => Number(node.dataset.id)).filter(Number.isFinite)
+      const byId = new Map(reversedQueue.value.map((song) => [Number(song.id), song]))
+      songs.value = songs.value.length > 0
+        ? [songs.value[0], ...orderedIds.map((id) => byId.get(id)).filter(Boolean)]
+        : []
+
+      try {
+        await axios.put(`${API_BASE}/api/queue/order`, { song_ids: orderedIds })
+      } catch (e) {
+        showNotice('队列已在其他设备发生变化，已刷新为最新顺序。', 'error')
+      } finally {
+        queueBusy = false
+        await fetchSongs(true)
+      }
+    },
+  })
 }
 
 const addSong = async () => {
@@ -670,14 +716,17 @@ const queueFromSearch = async (item) => {
 onMounted(async () => {
   await refreshControlState()
 
-  fetchSongs()
+  await fetchSongs()
   refreshInterval = setInterval(fetchSongs, 2000)
   connectWS()
   window.addEventListener('resize', onResize)
+  await nextTick()
+  initQueueSorting()
 })
 
 onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval)
+  if (queueSortable) queueSortable.destroy()
   if (ws) ws.close()
   stopSearchPolling()
   if (noticeTimer) clearTimeout(noticeTimer)
@@ -862,6 +911,25 @@ onUnmounted(() => {
   gap: 8px;
   padding: 8px 0;
   border-bottom: 1px solid #333;
+  border-radius: 6px;
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.queue-list .queue-item-chosen {
+  background: #26364d;
+  box-shadow: inset 3px 0 0 #63a4ff;
+}
+.queue-list .queue-item-ghost {
+  background: #182231;
+  border: 1px dashed #63a4ff;
+  opacity: 0.42;
+}
+.queue-list .queue-item-dragging {
+  background: #26364d;
+  border: 1px solid #63a4ff;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.38);
 }
 .queue-list .info {
   flex: 1 1 auto;

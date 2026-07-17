@@ -7,6 +7,7 @@ import time
 import sys
 import multiprocessing as mp
 import shutil
+import sqlite3
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from queue import Empty
 from huey import SqliteHuey
@@ -54,6 +55,60 @@ ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 VIDEO_EXTENSIONS = ('.mp4', '.webm', '.mkv')
 MAX_VIDEO_SIZE_BYTES = 200 * 1000 * 1000
+
+SONG_TASK_NAMES = {
+    'process_song_task',
+    'download_song_task',
+    'separate_song_task',
+    'process_music_download_task',
+    'separate_music_song_task',
+}
+
+
+def get_song_task_priority(song_id: int) -> int:
+    songs = db.get_all_songs()
+    count = len(songs)
+    for index, song in enumerate(songs):
+        if int(song['id']) == int(song_id):
+            return count - index
+    return 0
+
+
+def reprioritize_queued_song_tasks() -> int:
+    """Atomically synchronize waiting Huey song tasks with the live queue."""
+    songs = db.get_all_songs()
+    priorities = {int(song['id']): len(songs) - index for index, song in enumerate(songs)}
+    updated = 0
+
+    conn = sqlite3.connect(TASK_DB_PATH, timeout=10)
+    try:
+        cursor = conn.cursor()
+        cursor.execute('BEGIN IMMEDIATE')
+        cursor.execute('SELECT id, data, priority FROM task WHERE queue = ?', (huey.storage.name,))
+        for row_id, task_data, current_priority in cursor.fetchall():
+            try:
+                task = huey.deserialize_task(task_data)
+                if task.name not in SONG_TASK_NAMES or not task.args:
+                    continue
+                song_id = int(task.args[0])
+                priority = priorities.get(song_id)
+                if priority is None or float(current_priority or 0) == float(priority):
+                    continue
+                task.priority = priority
+                cursor.execute(
+                    'UPDATE task SET data = ?, priority = ? WHERE id = ?',
+                    (huey.serialize_task(task), priority, row_id),
+                )
+                updated += cursor.rowcount
+            except (TypeError, ValueError, KeyError):
+                continue
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return updated
 
 
 def _display_resolution(format_info: dict):
@@ -465,6 +520,10 @@ def _format_size_text_from_bytes(file_size_bytes: int) -> str:
     return f"{size_val}B"
 
 
+def _song_cancelled(song_id: int) -> bool:
+    return db.get_song(song_id) is None
+
+
 @huey.task(queue=QUEUE_MUSIC_SERIAL)
 def process_music_download_task(song_id: int, song_record: dict, library_unique_key: str, library_item_id: int = None):
     with _task_lock("music_platform_serial"):
@@ -474,6 +533,8 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
 
         try:
             print(f"[MUSIC DOWNLOAD][HUEY] start song_id={song_id} title={(song_record or {}).get('song_name', '')}")
+            if _song_cancelled(song_id):
+                return
             db.update_status(song_id, 'downloading', 10, status_detail='Downloading Music...')
 
             save_dir = _make_music_save_dir((song_record or {}).get('source', ''), (song_record or {}).get('song_name', ''), (song_record or {}).get('singers', ''))
@@ -483,7 +544,11 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
                 cookies_file=None,
                 download_cover=True,
                 download_lyric=True,
+                cancel_check=lambda: _song_cancelled(song_id),
             )
+
+            if _song_cancelled(song_id):
+                return
 
             raw_audio_full_path = download_result['file_path']
             rel_raw_audio = os.path.relpath(raw_audio_full_path, songs_dir)
@@ -492,10 +557,19 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
             
             # Offload heavy separation to the QUEUE_SEPARATE worker
             # so that QUEUE_MUSIC_SERIAL (search & download) won't be blocked.
-            separate_music_song_task(song_id, download_result, save_dir, library_unique_key, library_item_id)
+            separate_music_song_task(
+                song_id,
+                download_result,
+                save_dir,
+                library_unique_key,
+                library_item_id,
+                priority=get_song_task_priority(song_id),
+            )
             
             print(f"[MUSIC DOWNLOAD][HUEY] done song_id={song_id}, dispatched to separation queue.")
         except Exception as exc:
+            if _song_cancelled(song_id):
+                return
             traceback_text = traceback.format_exc()
             print(f"[MUSIC DOWNLOAD][HUEY] failed song_id={song_id} error={exc}\n{traceback_text}")
             db.update_status(song_id, 'error', 0, error_msg=str(exc), status_detail='Music Download Failed')
@@ -505,6 +579,8 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
 def separate_music_song_task(song_id: int, download_result: dict, save_dir: str, library_unique_key: str, library_item_id: int = None):
     songs_dir = config.get("paths", {}).get("songs_dir", "./songs")
     try:
+        if _song_cancelled(song_id):
+            return
         raw_audio_full_path = download_result['file_path']
         db.update_status(song_id, 'processing', 0, status_detail='Removing Vocals...')
 
@@ -540,6 +616,16 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
             )
             sep_progress_re = re.compile(r'\[PROGRESS\]\s*(\d+)')
             while True:
+                if _song_cancelled(song_id):
+                    try:
+                        sep_proc.terminate()
+                        sep_proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            sep_proc.kill()
+                        except Exception:
+                            pass
+                    return
                 line = sep_proc.stdout.readline() if sep_proc.stdout else ''
                 if not line and sep_proc.poll() is not None:
                     break
@@ -558,6 +644,9 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
         if sep_return_code != 0 or not os.path.exists(instrumental_full_path):
             err_text = ('\n'.join(sep_output_lines[-20:]) or 'separation failed').strip()
             raise RuntimeError(f'vocal separation failed: {err_text}')
+
+        if _song_cancelled(song_id):
+            return
 
         rel_audio = os.path.relpath(instrumental_full_path, songs_dir)
         rel_raw_audio = os.path.relpath(raw_audio_full_path, songs_dir)
@@ -609,6 +698,8 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
             db.touch_music_library_item(lib_id)
 
     except Exception as exc:
+        if _song_cancelled(song_id):
+            return
         traceback_text = traceback.format_exc()
         print(f"[MUSIC DOWNLOAD][HUEY] failed separation song_id={song_id} error={exc}\n{traceback_text}")
         db.update_status(song_id, 'error', 0, error_msg=str(exc), status_detail='Separation Failed')
@@ -679,6 +770,16 @@ def run_command_with_progress(cmd, song_id, progress_parser=None, status_prefix=
     )
 
     while True:
+        if _get_song(song_id) is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            return None
         line = process.stdout.readline()
         if not line and process.poll() is not None:
             break
@@ -810,7 +911,7 @@ def process_song_task(song_id: int):
                      db.save_to_library(video_id, lib_entry['title'] or video_title, lib_entry['video_path'], lib_entry['audio_path'], lib_entry['raw_audio_path'], platform)
                      return
 
-    download_song_task(song_id)
+    download_song_task(song_id, priority=get_song_task_priority(song_id))
 
 
 @huey.task(queue=QUEUE_DOWNLOAD)
@@ -960,10 +1061,15 @@ def download_song_task(song_id: int):
                             song['url'],
                             '-f', f"{format_id},{audio_format['format_id']}",
                             '-o', out_tmpl,
+                            '--newline',
                         ] + cookies_arg
                         ret = run_command_with_progress(
                             cmd, song_id, dl_progress_parser, status_prefix=status_detail
                         )
+
+                        if ret is None:
+                            shutil.rmtree(staging_dir, ignore_errors=True)
+                            return
 
                         video_prefix = f"{video_id}.{format_id}."
                         downloaded_videos = [
@@ -1036,8 +1142,17 @@ def download_song_task(song_id: int):
                         song['url'],
                         '-f', 'bestvideo,bestaudio',
                         '-o', out_tmpl,
+                        '--newline',
                     ] + ['--playlist-items', '1', '--no-playlist'] + cookies_arg
                     ret = run_command_with_progress(cmd, song_id, dl_progress_parser, status_prefix="Downloading")
+                    if ret is None:
+                        for filename in os.listdir(target_dir):
+                            if filename.startswith(video_id) and filename.endswith(('.part', '.ytdl')):
+                                try:
+                                    os.remove(os.path.join(target_dir, filename))
+                                except OSError:
+                                    pass
+                        return
                     if ret != 0:
                         db.update_status(song_id, "error", 0, error_msg="Download Failed", status_detail="Download Failed")
                         return
@@ -1056,7 +1171,7 @@ def download_song_task(song_id: int):
                         raw_audio_path=os.path.relpath(full_audio_raw_path, songs_dir),
                     )
 
-            separate_song_task(song_id)
+            separate_song_task(song_id, priority=get_song_task_priority(song_id))
 
         except Exception as e:
             print(f"Task Error: {e}")

@@ -20,6 +20,8 @@ from src.tasks import (
     process_music_search_normal_task,
     process_music_search_qq_task,
     process_music_download_task,
+    get_song_task_priority,
+    reprioritize_queued_song_tasks,
     db,
 )
 from src.music_dl import MusicDLService
@@ -332,7 +334,7 @@ def add_song(request: SongRequest):
                  return {"status": "queued", "id": song_id, "title": lib_entry['title'], "message": "Restored from Library"}
     '''
 
-    process_song_task(song_id)
+    process_song_task(song_id, priority=get_song_task_priority(song_id))
     return {"status": "queued", "id": song_id, "title": clean_url}
 
 
@@ -490,7 +492,12 @@ def music_queue_from_search(req: MusicSearchQueueRequest):
     )
 
     library_unique_key = f"{platform}:{title}:{full_record.get('singers', '')}:{full_record.get('album', '')}:{full_record.get('ext', '')}"
-    process_music_download_task(song_id, full_record, library_unique_key)
+    process_music_download_task(
+        song_id,
+        full_record,
+        library_unique_key,
+        priority=get_song_task_priority(song_id),
+    )
     _huey_snapshot(limit=20)
     return {'status': 'queued', 'id': song_id, 'title': title}
 
@@ -703,6 +710,19 @@ def get_song(song_id: int):
 class MoveRequest(BaseModel):
     direction: str
 
+class QueueOrderRequest(BaseModel):
+    song_ids: List[int]
+
+@app.put("/api/queue/order")
+def reorder_songs(request: QueueOrderRequest):
+    try:
+        db.reorder_waiting_songs(request.song_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    updated_tasks = reprioritize_queued_song_tasks()
+    return {"status": "ok", "reprioritized_tasks": updated_tasks}
+
 @app.post("/song/{song_id}/move")
 def move_song(song_id: int, request: MoveRequest):
     if request.direction not in ['up', 'down', 'top']:
@@ -711,8 +731,10 @@ def move_song(song_id: int, request: MoveRequest):
     success = db.move_song(song_id, request.direction)
     if not success:
          raise HTTPException(status_code=400, detail="Move failed")
+
+    updated_tasks = reprioritize_queued_song_tasks()
     
-    return {"message": "Moved", "status": "ok"}
+    return {"message": "Moved", "status": "ok", "reprioritized_tasks": updated_tasks}
 
 @app.delete("/song/{song_id}")
 def delete_song(song_id: int):

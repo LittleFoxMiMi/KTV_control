@@ -104,11 +104,15 @@ let refreshInterval = null
 let musicSyncTimer = null
 let songOverlayTimer = null
 let musicAudioEngine = null
+let queueActionInFlight = false
 
 const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
 const MUSIC_SYNC_INTERVAL_MS = isMobile ? 100 : 70
 
-const nextSong = computed(() => (songs.value.length > 0 ? songs.value[0] : null))
+const nextSong = computed(() => {
+  const actionable = songs.value.find((song) => (song.status || '').toLowerCase() !== 'pending')
+  return actionable || songs.value[0] || null
+})
 const isMusicMode = computed(() => (currentSong.value?.media_type || 'video') === 'music')
 const ERROR_STATUSES = new Set(['error', 'failed'])
 
@@ -305,8 +309,8 @@ const fetchSongs = async () => {
 }
 
 const checkAutoPlay = () => {
-  if (!currentSong.value && songs.value.length > 0) {
-    const next = songs.value[0]
+  if (!currentSong.value && nextSong.value) {
+    const next = nextSong.value
     if (ERROR_STATUSES.has((next.status || '').toLowerCase())) {
       skipQueueHead(next)
       return
@@ -318,12 +322,17 @@ const checkAutoPlay = () => {
 }
 
 const skipQueueHead = async (song) => {
-  if (!song) return
+  if (!song || queueActionInFlight) return
+  queueActionInFlight = true
   try {
     await axios.delete(`${API_BASE}/song/${song.id}`)
   } catch (e) {}
   currentSong.value = null
-  fetchSongs()
+  try {
+    await fetchSongs()
+  } finally {
+    queueActionInFlight = false
+  }
 }
 
 const triggerSongOverlay = () => {
@@ -369,8 +378,8 @@ const skipCurrentOrHead = async () => {
     await onSongEnded()
     return
   }
-  if (songs.value.length > 0) {
-    await skipQueueHead(songs.value[0])
+  if (nextSong.value) {
+    await skipQueueHead(nextSong.value)
   }
 }
 

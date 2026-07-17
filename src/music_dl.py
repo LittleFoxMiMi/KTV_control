@@ -480,13 +480,24 @@ class MusicDLService:
         url: str,
         save_path: str,
         headers: Optional[dict] = None,
+        cancel_check=None,
     ) -> str:
-        with session.get(url, headers=headers or {}, stream=True, verify=False, timeout=30) as resp:
-            resp.raise_for_status()
-            with open(save_path, 'wb') as fp:
-                for chunk in resp.iter_content(chunk_size=1024):
-                    if chunk:
-                        fp.write(chunk)
+        try:
+            with session.get(url, headers=headers or {}, stream=True, verify=False, timeout=(10, 3)) as resp:
+                resp.raise_for_status()
+                with open(save_path, 'wb') as fp:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if cancel_check and cancel_check():
+                            raise RuntimeError('download cancelled')
+                        if chunk:
+                            fp.write(chunk)
+        except Exception:
+            try:
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+            except OSError:
+                pass
+            raise
         return save_path
 
     def _fix_file_extension(self, file_path: str, current_ext: str, song_name: str, save_dir: str):
@@ -661,6 +672,7 @@ class MusicDLService:
         cookies_file: Optional[str] = None,
         download_cover: bool = True,
         download_lyric: bool = True,
+        cancel_check=None,
     ) -> Dict:
         try:
             if not isinstance(song_record, dict):
@@ -688,7 +700,7 @@ class MusicDLService:
             file_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.{ext}'))
             warnings: List[str] = []
 
-            self._download_binary_file(session, download_url, file_path, headers=headers)
+            self._download_binary_file(session, download_url, file_path, headers=headers, cancel_check=cancel_check)
             file_path, ext, fix_warn = self._fix_file_extension(file_path, ext, song_name, save_dir)
             if fix_warn:
                 warnings.append(fix_warn)
@@ -698,8 +710,10 @@ class MusicDLService:
             if download_cover and cover_url.startswith('http'):
                 cover_path = sanitize_filepath(os.path.join(save_dir, f'{song_name}.jpg'))
                 try:
-                    self._download_binary_file(session, cover_url, cover_path, headers=headers)
+                    self._download_binary_file(session, cover_url, cover_path, headers=headers, cancel_check=cancel_check)
                 except Exception:
+                    if cancel_check and cancel_check():
+                        raise
                     cover_path = None
                     warnings.append('cover download failed')
 
@@ -710,6 +724,8 @@ class MusicDLService:
                 try:
                     lyric_text = ''
                     if isinstance(lyric_value, str) and lyric_value.startswith('http'):
+                        if cancel_check and cancel_check():
+                            raise RuntimeError('download cancelled')
                         with session.get(lyric_value, headers=headers, timeout=30, verify=False) as resp:
                             resp.raise_for_status()
                             lyric_text = resp.text
@@ -718,6 +734,8 @@ class MusicDLService:
                     with open(lyric_path, 'w', encoding='utf-8') as fp:
                         fp.write(lyric_text)
                 except Exception:
+                    if cancel_check and cancel_check():
+                        raise
                     lyric_path = None
                     warnings.append('lyric download failed')
 
