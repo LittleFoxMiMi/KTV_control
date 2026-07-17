@@ -110,66 +110,7 @@ const volInstMix = ref(80)
 
 let syncInterval = null
 let sourceChangeToken = 0
-let waitingDelayGate = false
-let delayBootstrapTimer = null
 let audioEngine = null
-
-const stopDelayBootstrapTimer = () => {
-    if (delayBootstrapTimer !== null) {
-        clearTimeout(delayBootstrapTimer)
-        delayBootstrapTimer = null
-    }
-}
-
-const applyPrerollVolumes = () => {
-    if (audioEngine) {
-        audioEngine.setTrackGains(PREROLL_VOLUME, PREROLL_VOLUME, true)
-        return
-    }
-    if (origAudioRef.value) {
-        origAudioRef.value.muted = false
-        origAudioRef.value.volume = PREROLL_VOLUME
-    }
-    if (instAudioRef.value) {
-        instAudioRef.value.muted = false
-        instAudioRef.value.volume = PREROLL_VOLUME
-    }
-}
-
-const startDelayBootstrap = () => {
-    if (!videoRef.value) return
-
-    stopDelayBootstrapTimer()
-
-    // Delay disabled: never enter preroll timing logic.
-    if (!delayEnabled.value) {
-        waitingDelayGate = false
-        immediateDelayCutover(true)
-        return
-    }
-
-    waitingDelayGate = true
-    applyPrerollVolumes()
-
-    if (origAudioRef.value) {
-        seekTo(origAudioRef.value, 0)
-        origAudioRef.value.playbackRate = videoRef.value.playbackRate
-        applyPlaybackState(origAudioRef.value)
-    }
-    if (instAudioRef.value) {
-        seekTo(instAudioRef.value, 0)
-        instAudioRef.value.playbackRate = videoRef.value.playbackRate
-        applyPlaybackState(instAudioRef.value)
-    }
-
-    const timerMs = Math.max(100, Number(effectiveDelay.value) + 100)
-    delayBootstrapTimer = setTimeout(() => {
-        waitingDelayGate = false
-        delayBootstrapTimer = null
-        immediateDelayCutover(true)
-        syncAudio()
-    }, timerMs)
-}
 
 // Restore settings
 const loadSettings = async () => {
@@ -247,16 +188,30 @@ const applyPlaybackState = (audioEl) => {
     }
 }
 
+const holdAudioAtDelayGate = () => {
+    const baseRate = videoRef.value?.playbackRate || 1
+    for (const audioEl of [origAudioRef.value, instAudioRef.value]) {
+        if (!audioEl) continue
+        if (!audioEl.paused) audioEl.pause()
+        if (audioEl.currentTime > 0.01) seekTo(audioEl, 0)
+        audioEl.playbackRate = baseRate
+    }
+}
+
 const immediateDelayCutover = (restoreVolumes = true) => {
     if (!videoRef.value) return
 
     const rawTargetTime = videoRef.value.currentTime - (effectiveDelay.value / 1000)
+    if (rawTargetTime < 0) {
+        holdAudioAtDelayGate()
+        if (restoreVolumes) applyTrackMode()
+        return
+    }
+
     const targetTime = Math.max(0, rawTargetTime)
     const baseRate = videoRef.value.playbackRate
 
     hardAlignTracks(origAudioRef.value, instAudioRef.value, targetTime, baseRate)
-
-    waitingDelayGate = false
 
     applyPlaybackState(origAudioRef.value)
     applyPlaybackState(instAudioRef.value)
@@ -273,18 +228,8 @@ const syncAudio = () => {
     const vTime = videoRef.value.currentTime
     const targetTime = vTime - (effectiveDelay.value / 1000)
 
-    if (waitingDelayGate) {
-        applyPrerollVolumes()
-        if (origAudioRef.value) {
-            seekTo(origAudioRef.value, 0)
-            origAudioRef.value.playbackRate = videoRef.value.playbackRate
-            applyPlaybackState(origAudioRef.value)
-        }
-        if (instAudioRef.value) {
-            seekTo(instAudioRef.value, 0)
-            instAudioRef.value.playbackRate = videoRef.value.playbackRate
-            applyPlaybackState(instAudioRef.value)
-        }
+    if (targetTime < 0) {
+        holdAudioAtDelayGate()
         return
     }
 
@@ -345,8 +290,7 @@ const syncAfterSourceChange = async () => {
     syncAudio()
     if (!needsGesture.value) {
         await tryPlay(videoRef.value, true)
-        if (delayEnabled.value) startDelayBootstrap()
-        else syncAudio()
+        syncAudio()
     }
 }
 
@@ -379,7 +323,6 @@ const tryPlay = async (el, requireGesture = false) => {
 }
 
 const pauseAll = () => {
-    stopDelayBootstrapTimer()
     if (videoRef.value && !videoRef.value.paused) videoRef.value.pause()
     if (origAudioRef.value && !origAudioRef.value.paused) origAudioRef.value.pause()
     if (instAudioRef.value && !instAudioRef.value.paused) instAudioRef.value.pause()
@@ -394,17 +337,11 @@ const unlockAudio = async () => {
         return
     }
     await tryPlay(videoRef.value, true)
-    await Promise.all([
-        tryPlay(origAudioRef.value, true),
-        tryPlay(instAudioRef.value, true)
-    ])
     syncAudio()
 }
 
 const toggleDelay = () => {
     delayEnabled.value = !delayEnabled.value
-    waitingDelayGate = false
-    stopDelayBootstrapTimer()
     immediateDelayCutover(true)
 }
 
@@ -424,8 +361,6 @@ const setTrack = (mode) => {
 
 const restartPlayback = async () => {
     if (!videoRef.value) return
-    waitingDelayGate = false
-    stopDelayBootstrapTimer()
 
     videoRef.value.currentTime = 0
     if (origAudioRef.value) seekTo(origAudioRef.value, 0)
@@ -435,18 +370,13 @@ const restartPlayback = async () => {
 
     if (!needsGesture.value) {
         await tryPlay(videoRef.value, true)
-        startDelayBootstrap()
+        syncAudio()
     }
 }
 
 const applyTrackMode = () => {
     if (!videoRef.value) return
 
-    if (waitingDelayGate) {
-        applyPrerollVolumes()
-        return
-    }
-    
     // Video always Muted
     videoRef.value.muted = true
 
@@ -549,15 +479,7 @@ onMounted(async () => {
             pauseAll()
             return
         }
-            if (videoRef.value && videoRef.value.currentTime < 0.35 && delayEnabled.value) {
-                startDelayBootstrap()
-            } else {
-                syncAudio()
-            }
-        await Promise.all([
-            tryPlay(origAudioRef.value, true),
-            tryPlay(instAudioRef.value, true)
-        ])
+        syncAudio()
     }
     if(v) {
         v.addEventListener('play', playAll)
@@ -598,7 +520,6 @@ watch(
 )
 
 onUnmounted(() => {
-    stopDelayBootstrapTimer()
     if (syncInterval) clearInterval(syncInterval)
     if (player.value) player.value.destroy()
     if (audioEngine) audioEngine.dispose()
@@ -637,14 +558,10 @@ defineExpose({
     },
     setDelayEnabled: (val) => {
         delayEnabled.value = !!val
-        waitingDelayGate = false
-        stopDelayBootstrapTimer()
         immediateDelayCutover()
     },
     setDelay: (val) => {
         delay.value = Number(val)
-        waitingDelayGate = false
-        stopDelayBootstrapTimer()
         immediateDelayCutover()
     },
     delay, // ref exposed
