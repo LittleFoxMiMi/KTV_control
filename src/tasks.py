@@ -1,17 +1,18 @@
-import os
 import json
-import subprocess
-import re
-import traceback
-import time
-import sys
 import multiprocessing as mp
+import os
+import re
 import shutil
 import sqlite3
+import subprocess
+import sys
+import time
+import traceback
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from queue import Empty
+
 from huey import SqliteHuey
-from huey.api import Task
+
 from src.database import SongDatabase
 from src.music_dl import MusicDLService
 
@@ -184,8 +185,23 @@ def _media_paths(target_dir: str, video_id: str, video_ext: str, audio_ext: str)
 def _validate_media_file(file_path: str):
     ffmpeg_path = config['paths'].get('ffmpeg_path', 'ffmpeg')
     result = subprocess.run(
-        [ffmpeg_path, '-v', 'error', '-i', file_path, '-map', '0',
-         '-c', 'copy', '-f', 'null', '-'],
+        [ffmpeg_path, '-hide_banner', '-v', 'error', '-xerror',
+         '-err_detect', 'explode', '-skip_frame', 'nokey', '-i', file_path,
+         '-map', '0:v:0', '-an', '-f', 'null', '-'],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
+    errors = (result.stderr or '').strip()
+    return result.returncode == 0 and not errors, errors
+
+
+def _validate_audio_file(file_path: str):
+    ffmpeg_path = config['paths'].get('ffmpeg_path', 'ffmpeg')
+    result = subprocess.run(
+        [ffmpeg_path, '-hide_banner', '-v', 'error', '-xerror',
+         '-i', file_path, '-map', '0:a:0', '-f', 'null', '-'],
         capture_output=True,
         text=True,
         encoding='utf-8',
@@ -897,12 +913,18 @@ def process_song_task(song_id: int):
             # Construct full paths from relative library paths
             full_video = os.path.join(songs_dir, lib_entry['video_path']) if lib_entry['video_path'] else None
             full_inst = os.path.join(songs_dir, lib_entry['audio_path']) if lib_entry['audio_path'] else None
+            full_raw = os.path.join(songs_dir, lib_entry['raw_audio_path']) if lib_entry['raw_audio_path'] else None
             
-            # We strictly require a valid Video and Instrumental for a "Hit"
+            # A library hit must include valid downloaded video/audio and an instrumental.
             if full_video and os.path.exists(full_video) and full_inst and os.path.exists(full_inst):
-                 db.update_status(song_id, "processing", 0, status_detail="Validating library video...")
+                 db.update_status(song_id, "processing", 0, status_detail="Validating library media...")
                  try:
                      valid_video, validation_error = _validate_media_file(full_video)
+                     if full_raw and os.path.exists(full_raw):
+                         valid_audio, audio_validation_error = _validate_audio_file(full_raw)
+                     else:
+                         valid_audio = False
+                         audio_validation_error = "Raw audio file is missing"
                  except OSError as exc:
                      db.update_status(
                          song_id,
@@ -918,6 +940,14 @@ def process_song_task(song_id: int):
                          os.remove(full_video)
                      except OSError:
                          pass
+                 if not valid_audio:
+                     print(f"Invalid library audio for {video_id}: {audio_validation_error}")
+                     if full_raw:
+                         try:
+                             os.remove(full_raw)
+                         except OSError:
+                             pass
+                 if not valid_video or not valid_audio:
                      db.delete_mv_library_song(video_id)
                      db.clear_media_paths(song_id)
                  else:
@@ -991,21 +1021,26 @@ def download_song_task(song_id: int):
 
                 if has_video and has_inst:
                     video_path = os.path.join(target_dir, video_files[0])
-                    db.update_status(song_id, "processing", 0, status_detail="Validating existing video...")
+                    raw_files = [
+                        os.path.join(target_dir, f) for f in existing_files
+                        if f.startswith(video_id)
+                        and (
+                            '.audio.' in f.lower()
+                            or f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))
+                        )
+                    ]
+                    db.update_status(song_id, "processing", 0, status_detail="Validating existing media...")
                     valid_video, validation_error = _validate_media_file(video_path)
-                    if valid_video:
+                    if raw_files:
+                        valid_audio, audio_validation_error = _validate_audio_file(raw_files[0])
+                    else:
+                        valid_audio = False
+                        audio_validation_error = "Raw audio file is missing"
+                    if valid_video and valid_audio:
                         print(f"Valid files found for {video_id}, skipping download.")
                         inst_files = [os.path.join(target_dir, f) for f in existing_files if 'instrumental' in f]
                         audio_inst = inst_files[0]
-                        raw_files = [
-                            os.path.join(target_dir, f) for f in existing_files
-                            if f.startswith(video_id)
-                            and (
-                                '.audio.' in f.lower()
-                                or f.lower().endswith(('.m4a', '.mp3', '.aac', '.opus'))
-                            )
-                        ]
-                        audio_raw = raw_files[0] if raw_files else video_path
+                        audio_raw = raw_files[0]
 
                         db.update_paths(
                             song_id,
@@ -1016,12 +1051,20 @@ def download_song_task(song_id: int):
                         db.update_status(song_id, "completed", 100, status_detail="Ready")
                         return
 
-                    print(f"Invalid existing video for {video_id}: {validation_error}")
-                    for filename in video_files:
-                        try:
-                            os.remove(os.path.join(target_dir, filename))
-                        except OSError:
-                            pass
+                    if not valid_video:
+                        print(f"Invalid existing video for {video_id}: {validation_error}")
+                        for filename in video_files:
+                            try:
+                                os.remove(os.path.join(target_dir, filename))
+                            except OSError:
+                                pass
+                    if not valid_audio:
+                        print(f"Invalid existing audio for {video_id}: {audio_validation_error}")
+                        for audio_path in raw_files:
+                            try:
+                                os.remove(audio_path)
+                            except OSError:
+                                pass
                     db.clear_media_paths(song_id)
 
             if should_download:
@@ -1036,7 +1079,7 @@ def download_song_task(song_id: int):
                             '--add-header', 'Referer:https://www.bilibili.com',
                             '--concurrent-fragments', '1',
                         ]
-                        download_extra_args = []
+                        download_extra_args = ['--concurrent-fragments', '1']
                     else:
                         info_extra_args = ['--playlist-items', '1', '--no-playlist']
                         download_extra_args = ['--playlist-items', '1', '--no-playlist']
@@ -1070,6 +1113,7 @@ def download_song_task(song_id: int):
                     os.makedirs(staging_dir, exist_ok=True)
                     out_tmpl = os.path.join(staging_dir, f"{video_id}.%(format_id)s.%(ext)s")
                     last_error = 'Download failed'
+                    audio_prefix = f"{video_id}.{audio_format['format_id']}."
 
                     for attempt, video_format in enumerate(video_candidates, start=1):
                         format_id = str(video_format['format_id'])
@@ -1092,6 +1136,9 @@ def download_song_task(song_id: int):
                         action = "Downloading" if attempt == 1 else "Retrying"
                         status_detail = f"{action} {resolution}p (attempt {attempt}/{attempt_count}, format {format_id})"
                         db.update_status(song_id, "downloading", 0, status_detail=status_detail)
+
+                        if attempt > 1:
+                            _remove_files_with_prefix(staging_dir, audio_prefix)
 
                         cmd = [
                             yt_dlp_path,
@@ -1118,6 +1165,7 @@ def download_song_task(song_id: int):
                         if ret != 0 or not downloaded_videos:
                             last_error = f"Format {format_id} download failed"
                             _remove_files_with_prefix(staging_dir, video_prefix)
+                            _remove_files_with_prefix(staging_dir, audio_prefix)
                             continue
 
                         downloaded_video = downloaded_videos[0]
@@ -1132,9 +1180,9 @@ def download_song_task(song_id: int):
                             last_error = f"Format {format_id} validation failed: {validation_error}"
                             print(last_error)
                             _remove_files_with_prefix(staging_dir, video_prefix)
+                            _remove_files_with_prefix(staging_dir, audio_prefix)
                             continue
 
-                        audio_prefix = f"{video_id}.{audio_format['format_id']}."
                         downloaded_audio = [
                             os.path.join(staging_dir, filename)
                             for filename in os.listdir(staging_dir)
@@ -1144,6 +1192,24 @@ def download_song_task(song_id: int):
                         if not downloaded_audio:
                             last_error = f"Audio format {audio_format['format_id']} is missing"
                             _remove_files_with_prefix(staging_dir, video_prefix)
+                            _remove_files_with_prefix(staging_dir, audio_prefix)
+                            continue
+
+                        db.update_status(
+                            song_id,
+                            "processing",
+                            100,
+                            status_detail=f"Validating audio (attempt {attempt}/{attempt_count})",
+                        )
+                        valid_audio, audio_validation_error = _validate_audio_file(downloaded_audio[0])
+                        if not valid_audio:
+                            last_error = (
+                                f"Audio format {audio_format['format_id']} validation failed: "
+                                f"{audio_validation_error}"
+                            )
+                            print(last_error)
+                            _remove_files_with_prefix(staging_dir, video_prefix)
+                            _remove_files_with_prefix(staging_dir, audio_prefix)
                             continue
 
                         video_ext = os.path.splitext(downloaded_video)[1].lower()
@@ -1169,7 +1235,7 @@ def download_song_task(song_id: int):
                             "error",
                             0,
                             error_msg=last_error,
-                            status_detail="All video download attempts failed",
+                            status_detail="All media download attempts failed",
                         )
                         return
                 else:
