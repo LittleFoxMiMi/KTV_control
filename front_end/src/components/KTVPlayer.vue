@@ -67,7 +67,8 @@ import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
 import Plyr from 'plyr'
 import axios from 'axios'
 import { AudioEngine } from '../audio/AudioEngine.js'
-import { hardAlignTracks, seekMedia, syncFollowerToMaster } from '../audio/audioSync.js'
+import { PlaybackController } from '../audio/PlaybackController.js'
+import { TRACK_HARD_SYNC_THRESHOLD, hardAlignTracks, seekMedia } from '../audio/audioSync.js'
 import { API_BASE } from '../network.js'
 
 const props = defineProps({
@@ -86,9 +87,7 @@ const instAudioRef = ref(null)
 const player = ref(null)
 const needsGesture = ref(false)
 
-const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-const SYNC_CHECK_INTERVAL_MS = isMobile ? 100 : 70
-const VIDEO_LOOSE_SYNC_THRESHOLD = isMobile ? 0.35 : 0.25
+const VIDEO_LOOSE_SYNC_THRESHOLD = /Windows/i.test(navigator.userAgent) ? 0.6 : 0.8
 const PREROLL_VOLUME = 0.001
 
 // Toast
@@ -109,11 +108,12 @@ const volInstSolo = ref(100)
 const volOrigMix = ref(80)
 const volInstMix = ref(80)
 
-let syncInterval = null
 let sourceChangeToken = 0
 let sourceLoading = false
 let sourceOutputMuted = false
+let delayGateActive = false
 let audioEngine = null
+let playbackController = null
 
 // Restore settings
 const loadSettings = async () => {
@@ -182,22 +182,13 @@ const seekTo = (el, time) => {
     seekMedia(el, time)
 }
 
-const applyPlaybackState = (audioEl) => {
-    if (!audioEl || !videoRef.value) return
-    if (videoRef.value.paused) {
-        if (!audioEl.paused) audioEl.pause()
-    } else if (audioEl.paused) {
-        audioEl.play().catch(() => {})
-    }
-}
-
 const holdAudioAtDelayGate = () => {
     const baseRate = videoRef.value?.playbackRate || 1
     for (const audioEl of [origAudioRef.value, instAudioRef.value]) {
         if (!audioEl) continue
         if (!audioEl.paused) audioEl.pause()
         if (audioEl.currentTime > 0.01) seekTo(audioEl, 0)
-        audioEl.playbackRate = baseRate
+        if (Math.abs(audioEl.playbackRate - baseRate) > 0.001) audioEl.playbackRate = baseRate
     }
 }
 
@@ -205,14 +196,15 @@ const muteForSourceChange = () => {
     const token = ++sourceChangeToken
     sourceLoading = true
     sourceOutputMuted = true
+    delayGateActive = false
     audioEngine?.setOutputMuted(true)
+    playbackController?.beginLoading()
 
     for (const audioEl of [origAudioRef.value, instAudioRef.value]) {
         if (!audioEl) continue
         audioEl.muted = true
         if (!audioEl.paused) audioEl.pause()
     }
-    if (videoRef.value && !videoRef.value.paused) videoRef.value.pause()
     return token
 }
 
@@ -227,55 +219,48 @@ const releaseSourceMute = () => {
 
 const immediateDelayCutover = (restoreVolumes = true) => {
     if (!videoRef.value) return
-
-    const rawTargetTime = videoRef.value.currentTime - (effectiveDelay.value / 1000)
-    if (rawTargetTime < 0) {
-        holdAudioAtDelayGate()
-        if (restoreVolumes) applyTrackMode()
-        return
-    }
-
-    const targetTime = Math.max(0, rawTargetTime)
-    const baseRate = videoRef.value.playbackRate
-
-    hardAlignTracks(origAudioRef.value, instAudioRef.value, targetTime, baseRate)
-
-    applyPlaybackState(origAudioRef.value)
-    applyPlaybackState(instAudioRef.value)
+    playbackController?.syncNow('delay-change', true)
     if (restoreVolumes) applyTrackMode()
 }
 
-const syncAudio = () => {
-    if (!videoRef.value) return
-    if (sourceLoading) return
+const synchronizeAudio = ({ force = false } = {}) => {
+    if (!videoRef.value || sourceLoading) return false
     if (needsGesture.value) {
-        pauseAll()
-        return
+        return false
     }
     
     const vTime = videoRef.value.currentTime
     const targetTime = vTime - (effectiveDelay.value / 1000)
 
     if (targetTime < 0) {
+        delayGateActive = true
         holdAudioAtDelayGate()
-        return
+        return false
     }
 
     releaseSourceMute()
     const safeTargetTime = Math.max(0, targetTime)
     const baseRate = videoRef.value.playbackRate
-
-    applyPlaybackState(origAudioRef.value)
-    applyPlaybackState(instAudioRef.value)
-
-    // 原唱是固定主时钟，只有伴奏会进行速率纠偏。
-    if (origAudioRef.value) origAudioRef.value.playbackRate = baseRate
-    syncFollowerToMaster(origAudioRef.value, instAudioRef.value, baseRate)
-
-    // 视频只做宽松约束；一旦校正视频偏差，两条音轨同时切位。
-    if (origAudioRef.value && Math.abs(origAudioRef.value.currentTime - safeTargetTime) > VIDEO_LOOSE_SYNC_THRESHOLD) {
+    for (const audioEl of [origAudioRef.value, instAudioRef.value]) {
+        if (audioEl && Math.abs(audioEl.playbackRate - baseRate) > 0.001) audioEl.playbackRate = baseRate
+    }
+    if (force || delayGateActive) {
         hardAlignTracks(origAudioRef.value, instAudioRef.value, safeTargetTime, baseRate)
     }
+    delayGateActive = false
+    return true
+}
+
+const measurePlaybackDrift = () => {
+    const video = videoRef.value
+    const original = origAudioRef.value
+    const instrumental = instAudioRef.value
+    if (!video || !original || !instrumental || sourceLoading) return 0
+    const targetTime = video.currentTime - (effectiveDelay.value / 1000)
+    if (targetTime < 0) return 0
+    const videoDrift = Math.abs(original.currentTime - targetTime) / VIDEO_LOOSE_SYNC_THRESHOLD
+    const trackDrift = Math.abs(original.currentTime - instrumental.currentTime) / TRACK_HARD_SYNC_THRESHOLD
+    return Math.max(videoDrift, trackDrift)
 }
 
 const waitForReady = (el) => new Promise((resolve) => {
@@ -315,14 +300,10 @@ const syncAfterSourceChange = async (token) => {
 
     if (token !== sourceChangeToken) return
     sourceLoading = false
-    syncAudio()
-    if (!needsGesture.value) {
-        await tryPlay(videoRef.value, true)
-        syncAudio()
-    }
+    await playbackController?.ready({ autoplay: !needsGesture.value })
 }
 
-const updateSync = () => { syncAudio() }
+const updateSync = () => { playbackController?.syncNow('external', true) }
 const onDelayInput = () => { immediateDelayCutover() }
 
 const updateVolume = () => { applyTrackMode() }
@@ -336,26 +317,6 @@ const isAutoplayBlocked = (err) => {
     return name === 'NotAllowedError' || name === 'NotSupportedError' || /NotAllowedError/i.test(String(err))
 }
 
-const tryPlay = async (el, requireGesture = false) => {
-    if (!el) return true
-    try {
-        await el.play()
-        return true
-    } catch (err) {
-        if (requireGesture && isAutoplayBlocked(err)) {
-            needsGesture.value = true
-            pauseAll()
-        }
-        return false
-    }
-}
-
-const pauseAll = () => {
-    if (videoRef.value && !videoRef.value.paused) videoRef.value.pause()
-    if (origAudioRef.value && !origAudioRef.value.paused) origAudioRef.value.pause()
-    if (instAudioRef.value && !instAudioRef.value.paused) instAudioRef.value.pause()
-}
-
 const unlockAudio = async () => {
     needsGesture.value = false
     try {
@@ -364,8 +325,8 @@ const unlockAudio = async () => {
         needsGesture.value = true
         return
     }
-    await tryPlay(videoRef.value, true)
-    syncAudio()
+    playbackController?.unblock()
+    await playbackController?.play(true)
 }
 
 const toggleDelay = () => {
@@ -387,19 +348,8 @@ const setTrack = (mode) => {
     toastTimer = setTimeout(() => { showToast.value = false }, 3000)
 }
 
-const restartPlayback = async () => {
-    if (!videoRef.value) return
-
-    videoRef.value.currentTime = 0
-    if (origAudioRef.value) seekTo(origAudioRef.value, 0)
-    if (instAudioRef.value) seekTo(instAudioRef.value, 0)
-
-    immediateDelayCutover()
-
-    if (!needsGesture.value) {
-        await tryPlay(videoRef.value, true)
-        syncAudio()
-    }
+const restartPlayback = () => {
+    playbackController?.restart()
 }
 
 const applyTrackMode = () => {
@@ -470,7 +420,7 @@ onMounted(async () => {
         applyPitch()
         applyTrackMode()
     } catch (e) {
-        console.error('High-quality pitch shift unavailable; using original media output', e)
+        console.error('Audio graph unavailable; using media element output', e)
         audioEngine = null
     }
 
@@ -478,54 +428,27 @@ onMounted(async () => {
     // briefly starts both audio tracks on every fresh player mount.
     await loadSettings()
 
+    playbackController = new PlaybackController({
+        master: videoRef.value,
+        followers: [origAudioRef.value, instAudioRef.value],
+        synchronize: synchronizeAudio,
+        measureDrift: measurePlaybackDrift,
+        resumeOutput: () => audioEngine?.resume(),
+        onBlocked: () => { needsGesture.value = true },
+        isAutoplayBlocked
+    })
+    playbackController.attach()
+
     player.value = new Plyr(videoRef.value, {
         controls: ['play-large', 'play', 'progress', 'current-time', 'fullscreen'], 
         keyboard: { focused: true, global: true },
         muted: true,
         autoplay: true  // Enable AutoPlay
     })
-    
-    // Explicitly try to play after ready
-    player.value.on('ready', () => {
-        player.value.play().catch((err) => {
-            if (isAutoplayBlocked(err)) {
-                needsGesture.value = true
-                pauseAll()
-            }
-        })
-    })
-    
-    const v = videoRef.value
-    // Ensure all start together
-    const playAll = async () => {
-        if (needsGesture.value) {
-            pauseAll()
-            return
-        }
-        try {
-            const running = await audioEngine?.resume()
-            if (audioEngine && !running) {
-                needsGesture.value = true
-                pauseAll()
-                return
-            }
-        } catch (e) {
-            needsGesture.value = true
-            pauseAll()
-            return
-        }
-        syncAudio()
-    }
-    if(v) {
-        v.addEventListener('play', playAll)
-        v.addEventListener('playing', playAll)
-        v.addEventListener('pause', pauseAll)
-        v.addEventListener('waiting', pauseAll)
-        v.addEventListener('seeking', syncAudio)
-        v.addEventListener('seeked', syncAudio)
-    }
 
-    syncInterval = setInterval(syncAudio, SYNC_CHECK_INTERVAL_MS)
+    player.value.on('ready', () => {
+        playbackController?.play(true)
+    })
     
     // Resume Track Mode
     const savedMode = localStorage.getItem('ktv_track_mode')
@@ -559,7 +482,8 @@ watch(
 )
 
 onUnmounted(() => {
-    if (syncInterval) clearInterval(syncInterval)
+    playbackController?.dispose()
+    playbackController = null
     if (player.value) player.value.destroy()
     if (audioEngine) audioEngine.dispose()
     audioEngine = null
@@ -582,15 +506,13 @@ defineExpose({
     setPitch: (val) => {
         pitchSemitones.value = Number(val)
         applyPitch()
-        syncAudio()
     },
     setPitchEnabled: (val) => {
         pitchEnabled.value = !!val
         applyPitch()
-        syncAudio()
     },
     togglePlay: () => {
-        if(player.value) player.value.togglePlay()
+        playbackController?.toggle()
     },
     restart: () => {
         restartPlayback()

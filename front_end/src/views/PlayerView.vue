@@ -73,7 +73,8 @@ import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import axios from 'axios'
 import KTVPlayer from '../components/KTVPlayer.vue'
 import { AudioEngine } from '../audio/AudioEngine.js'
-import { hardAlignTracks, syncFollowerToMaster } from '../audio/audioSync.js'
+import { PlaybackController } from '../audio/PlaybackController.js'
+import { TRACK_HARD_SYNC_THRESHOLD, seekMedia } from '../audio/audioSync.js'
 import { API_BASE, getWebSocketUrl } from '../network.js'
 
 const WS_BASE = getWebSocketUrl('/ws/player')
@@ -101,13 +102,10 @@ const pitchEnabled = ref(false)
 
 let ws = null
 let refreshInterval = null
-let musicSyncTimer = null
 let songOverlayTimer = null
 let musicAudioEngine = null
+let musicPlaybackController = null
 let queueActionInFlight = false
-
-const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-const MUSIC_SYNC_INTERVAL_MS = isMobile ? 100 : 70
 
 const nextSong = computed(() => {
   const actionable = songs.value.find((song) => (song.status || '').toLowerCase() !== 'pending')
@@ -154,20 +152,23 @@ const applyMusicPitch = () => {
   musicAudioEngine?.setPitch(pitchSemitones.value, pitchEnabled.value)
 }
 
-const syncMusicTracks = () => {
+const synchronizeMusicTracks = ({ force = false } = {}) => {
   const orig = origMusicRef.value
   const inst = instMusicRef.value
-  if (!orig || !inst) return
-
-  if (orig.paused) {
-    if (!inst.paused) inst.pause()
-    return
-  }
-  if (inst.paused) inst.play().catch(() => {})
+  if (!orig || !inst) return false
 
   const baseRate = 1
-  orig.playbackRate = baseRate
-  syncFollowerToMaster(orig, inst, baseRate)
+  if (Math.abs(orig.playbackRate - baseRate) > 0.001) orig.playbackRate = baseRate
+  if (Math.abs(inst.playbackRate - baseRate) > 0.001) inst.playbackRate = baseRate
+  if (force && !inst.seeking) seekMedia(inst, orig.currentTime)
+  return true
+}
+
+const measureMusicDrift = () => {
+  const orig = origMusicRef.value
+  const inst = instMusicRef.value
+  if (!orig || !inst) return 0
+  return Math.abs(orig.currentTime - inst.currentTime) / TRACK_HARD_SYNC_THRESHOLD
 }
 
 const waitAudioReady = (audioEl, timeoutMs = 1500) => new Promise((resolve) => {
@@ -230,10 +231,8 @@ const startMusicPlayback = async () => {
   const inst = instMusicRef.value
   if (!orig || !inst) return
 
-  if (musicSyncTimer) {
-    clearInterval(musicSyncTimer)
-    musicSyncTimer = null
-  }
+  musicPlaybackController?.dispose()
+  musicPlaybackController = null
 
   await Promise.all([waitAudioReady(orig), waitAudioReady(inst)])
 
@@ -243,56 +242,39 @@ const startMusicPlayback = async () => {
       await musicAudioEngine.init()
       applyMusicPitch()
     } catch (e) {
-      console.error('High-quality music pitch shift unavailable; using original media output', e)
+      console.error('Music audio graph unavailable; using media element output', e)
       musicAudioEngine = null
     }
   }
 
-  hardAlignTracks(orig, inst, 0, 1)
   applyMusicTrackMode()
-
-  try {
-    const running = await musicAudioEngine?.resume()
-    if (musicAudioEngine && !running) {
-      musicNeedsGesture.value = true
-      return
-    }
-  } catch (e) {
-    musicNeedsGesture.value = true
-    return
-  }
-
+  musicPlaybackController = new PlaybackController({
+    master: orig,
+    followers: [inst],
+    synchronize: synchronizeMusicTracks,
+    measureDrift: measureMusicDrift,
+    resumeOutput: () => musicAudioEngine?.resume(),
+    onBlocked: () => { musicNeedsGesture.value = true }
+  })
+  musicPlaybackController.attach()
   musicNeedsGesture.value = false
-  const playResults = await Promise.allSettled([orig.play(), inst.play()])
-  if (playResults.some((result) => result.status === 'rejected')) {
-    orig.pause()
-    inst.pause()
-    musicNeedsGesture.value = true
-    return
-  }
-  if (Math.abs(inst.currentTime - orig.currentTime) > 0.01) {
-    inst.currentTime = orig.currentTime
-  }
-
-  syncMusicTracks()
-  musicSyncTimer = setInterval(syncMusicTracks, MUSIC_SYNC_INTERVAL_MS)
+  await musicPlaybackController.ready({ autoplay: true })
 }
 
 const unlockMusicAudio = async () => {
   try {
     await musicAudioEngine?.resume()
     musicNeedsGesture.value = false
-    await startMusicPlayback()
+    musicPlaybackController?.unblock()
+    await musicPlaybackController?.play(true)
   } catch (e) {
     musicNeedsGesture.value = true
   }
 }
 
 const stopMusicPlayback = () => {
-  if (musicSyncTimer) {
-    clearInterval(musicSyncTimer)
-    musicSyncTimer = null
-  }
+  musicPlaybackController?.dispose()
+  musicPlaybackController = null
   if (origMusicRef.value && !origMusicRef.value.paused) origMusicRef.value.pause()
   if (instMusicRef.value && !instMusicRef.value.paused) instMusicRef.value.pause()
   if (musicAudioEngine) musicAudioEngine.dispose()
@@ -464,31 +446,18 @@ const handleRemoteCommand = (cmd) => {
         break
       case 'setPitch':
         pitchSemitones.value = Number(cmd.value) || 0
-        applyMusicPitch()
-        syncMusicTracks()
         break
       case 'setPitchEnabled':
         pitchEnabled.value = !!cmd.value
-        applyMusicPitch()
-        syncMusicTracks()
         break
       case 'skip':
         skipCurrentOrHead()
         break
       case 'pause':
-        if (orig.paused) {
-          orig.play().catch(() => {})
-          inst.play().catch(() => {})
-        } else {
-          orig.pause()
-          inst.pause()
-        }
+        musicPlaybackController?.toggle()
         break
       case 'restart':
-        orig.currentTime = 0
-        inst.currentTime = 0
-        orig.play().catch(() => {})
-        inst.play().catch(() => {})
+        musicPlaybackController?.restart()
         break
       default:
         break

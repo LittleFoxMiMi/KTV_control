@@ -1,9 +1,9 @@
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
-
-export const TRACK_SOFT_SYNC_THRESHOLD = 0.005
-export const TRACK_HARD_SYNC_THRESHOLD = 0.03
-export const TRACK_MAX_RATE_DELTA = 0.01
-const HARD_SYNC_COOLDOWN_MS = 180
+// Mobile browsers commonly expose media clocks with several milliseconds of
+// jitter. Treat that as normal instead of continuously correcting the track.
+export const TRACK_SOFT_SYNC_THRESHOLD = 0.04
+export const TRACK_HARD_SYNC_THRESHOLD = 0.25
+export const TRACK_MAX_RATE_DELTA = 0
+const HARD_SYNC_COOLDOWN_MS = 1500
 const lastHardSyncAt = new WeakMap()
 
 export const seekMedia = (element, time) => {
@@ -25,9 +25,6 @@ export const syncFollowerToMaster = (master, follower, baseRate = 1) => {
   const absDrift = Math.abs(drift)
 
   if (master.paused || absDrift <= TRACK_SOFT_SYNC_THRESHOLD) {
-    if (Math.abs(follower.playbackRate - baseRate) > 0.001) {
-      follower.playbackRate = baseRate
-    }
     return absDrift
   }
 
@@ -38,16 +35,14 @@ export const syncFollowerToMaster = (master, follower, baseRate = 1) => {
       seekMedia(follower, master.currentTime)
       lastHardSyncAt.set(follower, now)
     }
-    follower.playbackRate = baseRate
+    if (Math.abs(follower.playbackRate - baseRate) > 0.01) {
+      follower.playbackRate = baseRate
+    }
     return absDrift
   }
 
-  const correction = clamp(absDrift * 0.35, 0.002, TRACK_MAX_RATE_DELTA)
-  follower.playbackRate = clamp(
-    drift > 0 ? baseRate + correction : baseRate - correction,
-    baseRate - TRACK_MAX_RATE_DELTA,
-    baseRate + TRACK_MAX_RATE_DELTA
-  )
+  // Do not use playbackRate as a continuous servo. On mobile devices that
+  // often invokes additional resampling and is audible as stutter.
   return absDrift
 }
 
