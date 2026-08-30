@@ -1,11 +1,10 @@
 import json
 import os
-import copy
+import re
 import shutil
 from types import MethodType
-from http.cookiejar import MozillaCookieJar
-from typing import Dict, List, Optional, Union
-from urllib.parse import urlparse, urljoin
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 from musicdl import musicdl
@@ -14,169 +13,187 @@ from musicdl.modules.sources import kuwo as kuwo_source
 from musicdl.modules.sources import netease as netease_source
 from musicdl.modules.utils import kugouutils as kugou_utils
 from musicdl.modules.utils import qqutils as qq_utils
-from musicdl.modules.utils import SongInfo, legalizestring, safeextractfromdict, resp2json
+from musicdl.modules.utils import SongInfo, legalizestring, resp2json
 from musicdl.modules.utils.misc import sanitize_filepath
+
+
+DEFERRED_DOWNLOAD_PREFIX = 'https://musicsearch.invalid/'
 
 
 class MusicDLService:
     def __init__(self, music_sources: Optional[List[str]] = None):
-        self.cookies_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'cookies'))
         self.musicdl_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Temp', 'musicdl_outputs'))
         self.legacy_musicdl_outputs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'musicdl_outputs'))
         os.makedirs(self.musicdl_cache_dir, exist_ok=True)
         self.default_sources = music_sources or [
-            'JBSouMusicClient',
-            'QQMusicClient',
             'KuwoMusicClient',
-            'KugouMusicClient',
             'NeteaseMusicClient',
+            'QQMusicClient',
         ]
         self.init_music_clients_cfg = {
-            'JBSouMusicClient': {'search_size_per_source': 10, 'work_dir': self.musicdl_cache_dir},
-            'QQMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
-            'NeteaseMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
             'KuwoMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'NeteaseMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
+            'QQMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
             'KugouMusicClient': {'search_size_per_source': 5, 'work_dir': self.musicdl_cache_dir},
-        }
-        self.requests_overrides = {
-            'QQMusicClient': {'cookies': {'quality_policy': 'mp3_only'}},
-            'KuwoMusicClient': {'cookies': {'quality_policy': 'mp3_only'}},
-            'KugouMusicClient': {'cookies': {'quality_policy': 'mp3_only'}},
         }
         self.netease_quality_levels = ['standard']
         self.qq_sorted_qualities = [('M500', '.mp3')]
         self.kuwo_music_qualities = [(320, 'mp3')]
         self.kuwo_enc_music_qualities = [(320, '320kmp3'), (192, '192kmp3'), (128, '128kmp3')]
         self.kugou_qualities = ('320', '128')
-        self.global_cookies: Optional[Union[str, Dict[str, str]]] = None
-        self.quark_cookie_clients = [
-            'YinyuedaoMusicClient',
-            'GequbaoMusicClient',
-            'MituMusicClient',
-            'BuguyyMusicClient',
-        ]
         self.last_search_results: Dict = {}
         self.last_music_records: Dict[str, Dict] = {}
         self.music_client: Optional[musicdl.MusicClient] = None
 
-    @staticmethod
-    def _cookiejar_to_dict(cookie_jar: requests.cookies.RequestsCookieJar) -> Dict[str, str]:
-        cookies = {}
-        for cookie in cookie_jar:
-            cookies[cookie.name] = cookie.value
-        return cookies
-
-    def set_global_cookies(self, cookies_with_str_or_dict_format: Union[str, Dict[str, str]]) -> None:
-        if isinstance(cookies_with_str_or_dict_format, str):
-            self.global_cookies = cookies_with_str_or_dict_format
-        elif isinstance(cookies_with_str_or_dict_format, dict):
-            self.global_cookies = dict(cookies_with_str_or_dict_format)
-        else:
-            raise ValueError('global cookies must be str or dict format')
-
-    def set_global_cookies_from_file(self, cookies_file: str) -> None:
-        cookie_jar = self._load_cookies_from_file(cookies_file)
-        self.set_global_cookies(self._cookiejar_to_dict(cookie_jar))
-
-    def _apply_global_cookies_to_init_cfg(self) -> None:
-        if not self.global_cookies:
-            return
-        for client_name in self.quark_cookie_clients:
-            if client_name not in self.init_music_clients_cfg:
-                self.init_music_clients_cfg[client_name] = {}
-            client_cfg = self.init_music_clients_cfg[client_name]
-            quark_cfg = client_cfg.get('quark_parser_config')
-            if not isinstance(quark_cfg, dict):
-                quark_cfg = {}
-            quark_cfg['cookies'] = self.global_cookies
-            client_cfg['quark_parser_config'] = quark_cfg
-
-    def _create_music_client(self, sources: List[str], requests_overrides: Dict, fast_search: bool) -> musicdl.MusicClient:
-        self._apply_global_cookies_to_init_cfg()
+    def _create_music_client(self, sources: List[str], requests_overrides: Optional[Dict] = None, fast_search: bool = True) -> musicdl.MusicClient:
         client = musicdl.MusicClient(
             music_sources=sources,
             init_music_clients_cfg=self.init_music_clients_cfg,
-            requests_overrides=requests_overrides,
+            requests_overrides=requests_overrides or {},
         )
-        self._enable_jbsou_light_search(client, enabled=fast_search)
         if fast_search:
+            self._enable_lightweight_search(client)
             for per_client in client.music_clients.values():
                 tester = getattr(per_client, 'audio_link_tester', None)
                 if tester is None:
                     continue
                 try:
-                    tester.test = lambda url, request_overrides=None: {'ok': True}
-                    tester.probe = lambda url, request_overrides=None: {'ext': 'mp3', 'file_size': 'NULL'}
+                    # musicdl 2.13.x calls test(..., renew_session=...) and
+                    # expects the complete link metadata, not just ``ok``.
+                    tester.test = (
+                        lambda url, request_overrides=None, renew_session=True, **kwargs: {
+                            'ok': True,
+                            'ext': 'mp3',
+                            'file_size': 'NULL',
+                            'file_size_bytes': 0,
+                            'download_url': url,
+                            'original_download_url': url,
+                            'download_url_status': {'ok': True},
+                        }
+                    )
+                    # Keep compatibility with pre-2.13 musicdl releases that
+                    # exposed a separate probe method.
+                    if hasattr(tester, 'probe'):
+                        tester.probe = lambda url, request_overrides=None, **kwargs: {
+                            'ext': 'mp3', 'file_size': 'NULL', 'file_size_bytes': 0,
+                        }
                 except Exception:
                     continue
         return client
 
-    def _enable_jbsou_light_search(self, client: musicdl.MusicClient, enabled: bool = True) -> None:
-        if not enabled:
-            return
-        jbsou_client = getattr(client, 'music_clients', {}).get('JBSouMusicClient')
-        if jbsou_client is None:
-            return
-        if getattr(jbsou_client, '_ktv_light_search_enabled', False):
-            return
+    @staticmethod
+    def _lightweight_search_result_list(source: str, payload: dict) -> list:
+        if not isinstance(payload, dict):
+            return []
+        if source == 'QQMusicClient':
+            return (((payload.get('music.search.SearchCgiService.DoSearchForQQMusicMobile') or {}).get('data') or {})
+                    .get('body') or {}).get('item_song') or []
+        if source == 'NeteaseMusicClient':
+            return ((payload.get('result') or {}).get('songs') or [])
+        if source == 'KuwoMusicClient':
+            return payload.get('abslist') or []
+        return []
 
-        def _light_search(bound_self, keyword: str = '', search_url: dict = None, request_overrides: dict = None, song_infos: list = None, progress=None, progress_id: int = 0):
-            request_overrides = request_overrides or {}
-            song_infos = song_infos if isinstance(song_infos, list) else []
-            base_url = 'https://www.jbsou.cn/'
-            source = ((search_url or {}).get('data') or {}).get('type') or ''
-            if source in ['netease', 'qq']:
-                return song_infos
-            try:
-                resp = bound_self.post(**(search_url or {}), **request_overrides)
-                resp.raise_for_status()
-                parsed_payload = resp2json(resp) or {}
-                search_results = parsed_payload.get('data') or []
-                debug_page = ((search_url or {}).get('data') or {}).get('page', '-')
-                print(f"[JBSOU RAW] source={source} keyword={keyword} page={debug_page} count={len(search_results) if isinstance(search_results, list) else 0}")
+    @staticmethod
+    def _lightweight_song_info(source_client, source: str, search_result: dict) -> SongInfo:
+        if source == 'QQMusicClient':
+            song_id = search_result.get('mid') or search_result.get('songmid') or search_result.get('id')
+            song_name = search_result.get('title') or search_result.get('songname') or ''
+            singers = ', '.join(
+                str(item.get('name')) for item in (search_result.get('singer') or [])
+                if isinstance(item, dict) and item.get('name')
+            )
+            album_obj = search_result.get('album') if isinstance(search_result.get('album'), dict) else {}
+            album = album_obj.get('title') or search_result.get('albumname') or ''
+        elif source == 'NeteaseMusicClient':
+            song_id = search_result.get('id')
+            song_name = search_result.get('name') or ''
+            singers = ', '.join(
+                str(item.get('name')) for item in (search_result.get('ar') or [])
+                if isinstance(item, dict) and item.get('name')
+            )
+            album_obj = search_result.get('al') if isinstance(search_result.get('al'), dict) else {}
+            album = album_obj.get('name') or ''
+        else:
+            song_id = search_result.get('MUSICRID') or search_result.get('musicrid') or search_result.get('id')
+            song_name = search_result.get('SONGNAME') or search_result.get('songName') or search_result.get('name') or ''
+            singers = search_result.get('ARTIST') or search_result.get('artist') or ''
+            album = search_result.get('ALBUM') or search_result.get('album') or ''
+
+        identifier = str(song_id or '')
+        # BaseMusicClient.search keeps only SongInfo objects with a valid URL.
+        # Use a non-routable marker so the result survives normalization; the
+        # download worker resolves it to a real URL only after selection.
+        deferred_url = f'{DEFERRED_DOWNLOAD_PREFIX}{source}/{identifier}'
+        if source == 'QQMusicClient':
+            raw_keys = ('id', 'mid', 'songmid', 'title', 'songname', 'singer', 'album', 'albumname', 'interval')
+        elif source == 'NeteaseMusicClient':
+            raw_keys = ('id', 'name', 'ar', 'al', 'dt')
+        else:
+            raw_keys = (
+                'MUSICRID', 'musicrid', 'SONGNAME', 'songName', 'name',
+                'ARTIST', 'artist', 'ALBUM', 'album', 'DURATION', 'duration',
+                'ALBUMPIC', 'albumpic', 'web_albumpic_short', 'hts_img',
+                'hts_MVPIC', 'pic',
+            )
+        raw_search = {key: search_result.get(key) for key in raw_keys if search_result.get(key) not in (None, '')}
+        return SongInfo(
+            raw_data={'search': raw_search, 'download': {}, 'lyric': {}},
+            source=source_client.source,
+            root_source=source,
+            song_name=legalizestring(song_name),
+            singers=legalizestring(singers),
+            album=legalizestring(album),
+            ext='mp3',
+            file_size='NULL',
+            identifier=identifier,
+            duration='-:-:-',
+            lyric='',
+            cover_url='',
+            download_url=deferred_url,
+            download_url_status={'ok': True, 'deferred': True},
+        )
+
+    def _enable_lightweight_search(self, client: musicdl.MusicClient) -> None:
+        for source in ('KuwoMusicClient', 'NeteaseMusicClient', 'QQMusicClient'):
+            source_client = getattr(client, 'music_clients', {}).get(source)
+            if source_client is None or getattr(source_client, '_ktv_lightweight_search', False):
+                continue
+
+            def _light_search(bound_self, keyword='', search_url=None, request_overrides=None, song_infos=None, progress=None, progress_id=0, _source=source):
+                request_overrides = request_overrides or {}
+                song_infos = song_infos if isinstance(song_infos, list) else []
+                if isinstance(search_url, str):
+                    search_endpoint, search_meta = search_url, {}
+                else:
+                    search_meta = dict(search_url or {})
+                    search_endpoint = search_meta.pop('url', '')
+                    if _source == 'QQMusicClient':
+                        search_meta.pop('page_no', None)
+                    elif _source == 'NeteaseMusicClient':
+                        search_meta.pop('page', None)
                 try:
-                    print(f"[JBSOU RAW DATA] {json.dumps(search_results, ensure_ascii=False)}")
-                except Exception:
-                    print(f"[JBSOU RAW DATA] {search_results}")
-                for search_result in search_results:
-                    if not isinstance(search_result, dict):
-                        continue
-                    song_id = search_result.get('songid')
-                    download_path = search_result.get('url')
-                    if not song_id or not download_path:
-                        continue
-                    download_url = urljoin(base_url, str(download_path))
-                    cover_url = urljoin(base_url, str(search_result.get('cover', '') or ''))
-                    ext = str(download_url).split('?')[0].split('.')[-1] if '.' in str(download_url).split('?')[0] else 'mp3'
+                    response = bound_self.get(search_endpoint, **search_meta, **request_overrides) if _source == 'KuwoMusicClient' else bound_self.post(search_endpoint, **search_meta, **request_overrides)
+                    response.raise_for_status()
+                    results = self._lightweight_search_result_list(_source, resp2json(response) or {})
+                    for search_result in results:
+                        if not isinstance(search_result, dict):
+                            continue
+                        song_infos.append(self._lightweight_song_info(bound_self, _source, search_result))
+                        if bound_self.strict_limit_search_size_per_page and len(song_infos) >= bound_self.search_size_per_page:
+                            break
+                    if progress is not None:
+                        progress.update(progress_id, description=f'{bound_self.source}.search >>> lightweight results')
+                except Exception as err:
+                    if progress is not None:
+                        try:
+                            progress.update(progress_id, description=f'{bound_self.source}.search >>> lightweight error: {err}')
+                        except (KeyError, IndexError, AttributeError):
+                            pass
+                return song_infos
 
-                    song_info = SongInfo(
-                        raw_data={'search': search_result, 'download': {}, 'lyric': {}},
-                        source=bound_self.source,
-                        root_source=source,
-                        song_name=legalizestring(safeextractfromdict(search_result, ['name'], None)),
-                        singers=legalizestring(str(safeextractfromdict(search_result, ['artist'], '')).replace('/', ', ')),
-                        album=legalizestring(search_result.get('album')),
-                        ext=ext or 'mp3',
-                        file_size='NULL',
-                        identifier=str(song_id),
-                        duration='-:-:-',
-                        lyric='NULL',
-                        cover_url=cover_url,
-                        download_url=download_url,
-                        download_url_status={'ok': True},
-                    )
-                    song_infos.append(song_info)
-                    if bound_self.strict_limit_search_size_per_page and len(song_infos) >= bound_self.search_size_per_page:
-                        break
-                if progress is not None:
-                    progress.update(progress_id, description=f"{bound_self.source}.search >>> {search_url} (Success, lightweight)")
-            except Exception as err:
-                if progress is not None:
-                    progress.update(progress_id, description=f"{bound_self.source}.search >>> {search_url} (Error: {err})")
-            return song_infos
-
-        jbsou_client._search = MethodType(_light_search, jbsou_client)
-        jbsou_client._ktv_light_search_enabled = True
+            source_client._search = MethodType(_light_search, source_client)
+            source_client._ktv_lightweight_search = True
 
     def _apply_runtime_quality_policy(self) -> None:
         try:
@@ -184,7 +201,9 @@ class MusicDLService:
         except Exception:
             pass
         try:
-            qq_utils.SongFileType.SORTED_QUALITIES.value = list(self.qq_sorted_qualities)
+            # ``SORTED_QUALITIES`` is an Enum member whose value is a mutable
+            # list; mutate it in place so the quality order actually changes.
+            qq_utils.SongFileType.SORTED_QUALITIES.value[:] = list(self.qq_sorted_qualities)
         except Exception:
             pass
         try:
@@ -198,38 +217,6 @@ class MusicDLService:
         except Exception:
             pass
 
-    def _build_search_requests_overrides(self, source_cookies_files: Optional[Dict[str, str]] = None) -> Dict:
-        merged = copy.deepcopy(self.requests_overrides)
-        source_cookies_files = source_cookies_files or {}
-        for source, cookies_file in source_cookies_files.items():
-            if not cookies_file or not os.path.isfile(cookies_file):
-                continue
-            if source not in merged:
-                merged[source] = {}
-            try:
-                merged[source]['cookies'] = self._load_cookies_from_file(cookies_file)
-            except Exception:
-                pass
-        return merged
-
-    def _build_source_cookie_files_from_map(self, source_cookie_file_map: Optional[Dict[str, str]]) -> Dict[str, str]:
-        mapping: Dict[str, str] = {}
-        for source, file_name in (source_cookie_file_map or {}).items():
-            if not source or not file_name:
-                continue
-            abs_path = os.path.join(self.cookies_dir, file_name)
-            if os.path.isfile(abs_path):
-                mapping[source] = abs_path
-        return mapping
-
-    def _strip_netease_cookies_for_search(self, requests_overrides: Dict) -> Dict:
-        result = copy.deepcopy(requests_overrides)
-        if 'NeteaseMusicClient' in result and isinstance(result['NeteaseMusicClient'], dict):
-            result['NeteaseMusicClient'].pop('cookies', None)
-            if not result['NeteaseMusicClient']:
-                result.pop('NeteaseMusicClient', None)
-        return result
-
     @staticmethod
     def _cover_penalty(song_name: str) -> int:
         text = str(song_name or '').lower()
@@ -241,11 +228,9 @@ class MusicDLService:
             return records
 
         source_priority = {
-            'JBSouMusicClient': 0,
-            'QQMusicClient': 0,
+            'KuwoMusicClient': 0,
             'NeteaseMusicClient': 1,
-            'KuwoMusicClient': 2,
-            'KugouMusicClient': 3,
+            'QQMusicClient': 2,
         }
         return sorted(
             records,
@@ -259,23 +244,19 @@ class MusicDLService:
         self,
         keyword: str,
         music_sources: Optional[List[str]] = None,
-        source_cookies_files: Optional[Dict[str, str]] = None,
-        source_cookie_file_map: Optional[Dict[str, str]] = None,
-        all_cookies_file: Optional[str] = None,
         fast_search: bool = True,
         enable_qq_separate_search: bool = False,
         sort_mode: str = 'default',
     ) -> Dict:
-        if all_cookies_file and os.path.isfile(all_cookies_file):
-            self.set_global_cookies_from_file(all_cookies_file)
         sources = music_sources or self.default_sources
         self._apply_runtime_quality_policy()
-        mapped_source_cookie_files = self._build_source_cookie_files_from_map(source_cookie_file_map)
-        source_cookies_files = source_cookies_files or {}
-        source_cookies_files.update(mapped_source_cookie_files)
-        requests_overrides = self._build_search_requests_overrides(source_cookies_files)
-        requests_overrides = self._strip_netease_cookies_for_search(requests_overrides)
-        effective_sources = [source for source in sources if source != 'QQMusicClient']
+        requests_overrides = {}
+        # Only clients configured by this service are searchable. This keeps
+        # removed/unknown source names from being re-enabled by callers that
+        # pass an explicit ``music_sources`` list.
+        effective_sources = [source for source in sources if source in self.init_music_clients_cfg]
+        if not effective_sources:
+            effective_sources = list(self.default_sources)
 
         if enable_qq_separate_search:
             effective_sources = ['QQMusicClient']
@@ -302,6 +283,7 @@ class MusicDLService:
                     'cover_url': per_source_search_result.get('cover_url', ''),
                     'lyric': self._clean_nullish(per_source_search_result.get('lyric', ''), default=''),
                     'raw_search': (((per_source_search_result.get('raw_data') or {}) if isinstance(per_source_search_result.get('raw_data'), dict) else {}).get('search') or {}),
+                    'search_keyword': keyword,
                     'work_dir': per_source_search_result.get('work_dir', ''),
                     'ext': ext,
                 }
@@ -335,30 +317,115 @@ class MusicDLService:
             'qq_separate_search': enable_qq_separate_search,
         }
 
-    def _load_cookies_from_file(self, cookies_file: str) -> requests.cookies.RequestsCookieJar:
-        if not os.path.isfile(cookies_file):
-            raise FileNotFoundError(f'cookies file not found: {cookies_file}')
+    def resolve_deferred_music_record(self, song_record: Dict) -> Dict:
+        """Resolve a lightweight search row when the user actually selects it."""
+        if not isinstance(song_record, dict):
+            raise ValueError('song_record must be dict')
+        deferred_url = str(song_record.get('download_url') or '')
+        if not deferred_url.startswith(DEFERRED_DOWNLOAD_PREFIX):
+            return song_record
 
-        cookie_jar = requests.cookies.RequestsCookieJar()
+        source = str(song_record.get('source') or '')
+        keyword = str(song_record.get('search_keyword') or '').strip()
+        if not keyword:
+            keyword = ' '.join(filter(None, [str(song_record.get('song_name') or ''), str(song_record.get('singers') or '')])).strip()
+        if not source or not keyword:
+            raise RuntimeError('lightweight search result is missing source or title')
 
+        raw_search = song_record.get('raw_search') if isinstance(song_record.get('raw_search'), dict) else {}
+        # Apply the service's configured quality order in the resolver process
+        # as well; this process starts with a fresh module on Windows.
+        self._apply_runtime_quality_policy()
+        client = self._create_music_client([source], fast_search=False)
+        source_client = client.music_clients.get(source)
+        if source_client is None:
+            raise RuntimeError(f'unsupported music source: {source}')
+
+        request_overrides = {}
+        song_info_flac = source_client._parsewiththirdpartapis(
+            search_result=dict(raw_search), request_overrides=request_overrides,
+        )
+        song_info = song_info_flac
         try:
-            mozilla_jar = MozillaCookieJar(cookies_file)
-            mozilla_jar.load(ignore_discard=True, ignore_expires=True)
-            for c in mozilla_jar:
-                cookie_jar.set(c.name, c.value, domain=c.domain, path=c.path)
-            return cookie_jar
+            # The app's quality policy (standard/320K/M500) must win over a
+            # lossless result returned by the fallback parser.
+            lossless_quality_is_sufficient = False
+            song_info = source_client._parsewithofficialapiv1(
+                search_result=dict(raw_search),
+                # Do not pass a third-party Hi-Res candidate here: some
+                # clients compare its quality label against the configured
+                # list and otherwise raise before trying the requested level.
+                song_info_flac=None,
+                lossless_quality_is_sufficient=lossless_quality_is_sufficient,
+                request_overrides=request_overrides,
+            )
         except Exception:
             pass
+        selected = song_info if song_info.with_valid_download_url else song_info_flac
+        if not selected.with_valid_download_url:
+            raise RuntimeError(f'failed to resolve download URL for {source} result')
 
-        with open(cookies_file, 'r', encoding='utf-8') as fp:
-            for line in fp:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                name, value = line.split('=', 1)
-                cookie_jar.set(name.strip(), value.strip())
+        resolved = selected.todict()
+        if source == 'NeteaseMusicClient' and not self._clean_nullish(resolved.get('lyric', ''), default=''):
+            # Third-party URL resolvers often omit lyrics. Fetch only the
+            # selected song's lyric after URL resolution, never during search.
+            try:
+                lyric_response = source_client.post(
+                    'https://interface3.music.163.com/api/song/lyric',
+                    data={
+                        'id': str(raw_search.get('id')),
+                        'cp': 'false', 'tv': '0', 'lv': '0', 'rv': '0',
+                        'kv': '0', 'yv': '0', 'ytv': '0', 'yrv': '0',
+                    },
+                    timeout=10,
+                    **request_overrides,
+                )
+                lyric_response.raise_for_status()
+                lyric_payload = resp2json(lyric_response) or {}
+                lyric_text = ((lyric_payload.get('lrc') or {}).get('lyric') or '') if isinstance(lyric_payload, dict) else ''
+                if lyric_text:
+                    resolved['lyric'] = lyric_text
+                    resolved.setdefault('raw_data', {}).setdefault('lyric', {})
+                    resolved['raw_data']['lyric'] = lyric_payload
+            except Exception:
+                pass
 
-        return cookie_jar
+        if str(resolved.get('ext') or '').lower() != 'mp3' and source == 'NeteaseMusicClient':
+            # Some third-party Netease resolvers ignore ``standard`` and
+            # return Hi-Res/FLAC. Request the standard MP3 URL explicitly.
+            try:
+                response = requests.get(
+                    'https://musicapi.haitangw.net/music/wy.php',
+                    params={'id': str(raw_search.get('id')), 'level': 'standard', 'type': 'json'},
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = resp2json(response) or {}
+                data = payload.get('data') if isinstance(payload, dict) else None
+                mp3_url = data.get('url') if isinstance(data, dict) else ''
+                if isinstance(mp3_url, str) and mp3_url.startswith('http') and mp3_url.lower().split('?', 1)[0].endswith('.mp3'):
+                    resolved['download_url'] = mp3_url
+                    resolved['ext'] = 'mp3'
+                    if isinstance(data, dict):
+                        resolved['song_name'] = legalizestring(data.get('name') or resolved.get('song_name'))
+                        resolved['singers'] = legalizestring(str(data.get('artist') or resolved.get('singers') or '').replace('/', ', '))
+                        resolved['album'] = legalizestring(data.get('album') or resolved.get('album'))
+                        resolved['cover_url'] = data.get('pic') or resolved.get('cover_url', '')
+                        if data.get('size'):
+                            resolved['file_size'] = str(data.get('size'))
+                            size_match = re.match(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)\s*$', str(data.get('size')), re.IGNORECASE)
+                            if size_match:
+                                multiplier = {'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3}[size_match.group(2).upper()]
+                                resolved['file_size_bytes'] = int(float(size_match.group(1)) * multiplier)
+                        resolved.setdefault('raw_data', {}).setdefault('download', {}).update(data)
+            except Exception:
+                pass
+
+        if str(resolved.get('ext') or '').lower() != 'mp3':
+            raise RuntimeError(f'no MP3 download URL available for {source} result')
+        return resolved
+
     @staticmethod
     def _normalize_text(text: str) -> str:
         return ''.join(str(text or '').lower().split())
@@ -412,6 +479,15 @@ class MusicDLService:
         raw_search = song_info.get('raw_search') or {}
         if not isinstance(raw_search, dict):
             raw_search = {}
+        if not raw_search:
+            raw_data = song_info.get('raw_data') or {}
+            if isinstance(raw_data, dict):
+                raw_lyric = raw_data.get('lyric')
+                if isinstance(raw_lyric, str) and raw_lyric.strip():
+                    return raw_lyric
+                raw_search = raw_data.get('search') or {}
+                if not isinstance(raw_search, dict):
+                    raw_search = {}
         raw_lrc = self._clean_nullish(raw_search.get('lrc', ''), default='')
         if not raw_lrc:
             return ''
@@ -419,13 +495,19 @@ class MusicDLService:
             return 'https:' + raw_lrc
         if raw_lrc.startswith('http://') or raw_lrc.startswith('https://'):
             return raw_lrc
-        return urljoin('https://www.jbsou.cn/', raw_lrc)
+        return ''
 
     def _resolve_cover_url(self, song_info: Dict) -> str:
         source = song_info.get('source', '')
         raw_search = song_info.get('raw_search') or {}
         if not isinstance(raw_search, dict):
             raw_search = {}
+        if not raw_search:
+            raw_data = song_info.get('raw_data') or {}
+            if isinstance(raw_data, dict):
+                raw_search = raw_data.get('search') or {}
+                if not isinstance(raw_search, dict):
+                    raw_search = {}
 
         candidates: List[str] = []
         if song_info.get('cover_url'):
@@ -437,6 +519,8 @@ class MusicDLService:
                 raw_search.get('albumpic'),
                 raw_search.get('ALBUMPIC'),
                 raw_search.get('hts_img'),
+                raw_search.get('hts_MVPIC'),
+                raw_search.get('pic'),
             ]
             for item in kuwo_candidates:
                 if not item:
@@ -445,7 +529,16 @@ class MusicDLService:
                 if item.startswith('http') or item.startswith('//'):
                     candidates.append(item)
                 else:
-                    candidates.append('https://img4.kuwo.cn/star/albumcover/300/' + item.lstrip('/'))
+                    # Search returns paths such as ``120/s4s42/...jpg``.
+                    # The old img4 HTTPS host now returns 404/514; kwcdn's
+                    # HTTP album-cover endpoint is the working one.
+                    cover_path = item.lstrip('/')
+                    if cover_path.startswith('120/'):
+                        cover_path = cover_path[4:]
+                    candidates.extend([
+                        f'http://img1.kwcdn.kuwo.cn/star/albumcover/240/{cover_path}',
+                        f'http://img1.kwcdn.kuwo.cn/star/albumcover/500/{cover_path}',
+                    ])
 
         if source == 'QQMusicClient':
             album_mid = ''
@@ -535,10 +628,9 @@ class MusicDLService:
         current_singers = self._normalize_text(current_song_info.get('singers', ''))
 
         source_priority = {
-            'QQMusicClient': 0,
-            'KuwoMusicClient': 1,
-            'KugouMusicClient': 2,
-            'NeteaseMusicClient': 3,
+            'KuwoMusicClient': 0,
+            'NeteaseMusicClient': 1,
+            'QQMusicClient': 2,
         }
 
         candidates = []
@@ -568,11 +660,18 @@ class MusicDLService:
         )
         return candidates[0]
 
+    def _create_download_session(self, source: str) -> requests.Session:
+        session = requests.Session()
+        client_obj = getattr(self.music_client, 'music_clients', {}).get(source) if self.music_client else None
+        built_in_cookies = getattr(client_obj, 'default_download_cookies', {}) if client_obj else {}
+        if isinstance(built_in_cookies, dict):
+            session.cookies.update(built_in_cookies)
+        return session
+
     def download_music(
         self,
         song_id: int,
         save_dir: str,
-        cookies_file: Optional[str] = None,
         prefer_mp3: bool = True,
         allow_non_mp3_fallback: bool = False,
         download_cover: bool = True,
@@ -605,9 +704,7 @@ class MusicDLService:
             if not headers:
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'}
 
-            session = requests.Session()
-            if cookies_file:
-                session.cookies.update(self._load_cookies_from_file(cookies_file))
+            session = self._create_download_session(source)
 
             os.makedirs(save_dir, exist_ok=True)
             song_name = song_info.get('song_name', f'song_{song_id}')
@@ -669,7 +766,6 @@ class MusicDLService:
         self,
         song_record: Dict,
         save_dir: str,
-        cookies_file: Optional[str] = None,
         download_cover: bool = True,
         download_lyric: bool = True,
         cancel_check=None,
@@ -690,9 +786,7 @@ class MusicDLService:
             if not headers:
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'}
 
-            session = requests.Session()
-            if cookies_file:
-                session.cookies.update(self._load_cookies_from_file(cookies_file))
+            session = self._create_download_session(source)
 
             os.makedirs(save_dir, exist_ok=True)
             song_name = song_record.get('song_name') or 'song'
@@ -759,28 +853,10 @@ class MusicDLService:
 if __name__ == '__main__':
     service = MusicDLService()
 
-    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
-    source_cookie_file_map = {
-        'QQMusicClient': 'QQ.txt',
-        'NeteaseMusicClient': '163.txt',
-        'KuwoMusicClient': '',
-        'KugouMusicClient': '',
-    }
-    if os.path.isfile(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as fp:
-                cfg = json.load(fp)
-            from_cfg = ((cfg.get('music') or {}).get('cookie_file_map') or {})
-            if isinstance(from_cfg, dict) and from_cfg:
-                source_cookie_file_map = {str(k): str(v) for k, v in from_cfg.items()}
-        except Exception:
-            pass
-
     test_keyword = '春雪'
     print(f'[TEST] search keyword: {test_keyword}')
     search_result = service.search_music(
         test_keyword,
-        source_cookie_file_map=source_cookie_file_map,
         fast_search=True,
         enable_qq_separate_search=False,
         sort_mode='original_first',
@@ -794,13 +870,11 @@ if __name__ == '__main__':
             exit(0)
         test_song_id = input(f'input song id to download (0-{search_result["total"] - 1}): ')
         test_save_dir = os.path.join(os.path.dirname(__file__), '..', 'test')
-        test_cookies_file = os.path.join(os.path.dirname(__file__), '..', 'cookies', '163.txt')
         print(f'[TEST] try downloading song_id={test_song_id}')
         try:
             download_result = service.download_music(
                 song_id=test_song_id,
                 save_dir=test_save_dir,
-                cookies_file=test_cookies_file if os.path.isfile(test_cookies_file) else None,
                 prefer_mp3=True,
                 allow_non_mp3_fallback=False,
                 download_cover=True,

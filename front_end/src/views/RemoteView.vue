@@ -108,7 +108,7 @@
         </template>
         <template v-else>
           <div class="spinner-ring"></div>
-          <div class="search-progress-hint">正在搜索，通常约 20s</div>
+          <div class="search-progress-hint">正在快速搜索...</div>
         </template>
         <button v-if="searchRunning" class="btn-cancel center-cancel" @click="cancelSearch">取消搜索</button>
         <div class="search-progress-text" v-if="showDeterminateProgress && searchTotalSources > 0">
@@ -142,14 +142,11 @@
           </div>
         </div>
 
-        <div v-if="showJBSearchEntry" class="search-entry search-action" @click="startJBSearch">
-          🔎 点击进行网络搜索（JBSou）
+        <div v-if="showKuwoSearchEntry" class="search-entry search-action" @click="startKuwoSearch">
+          🔎 点击进行网络搜索（酷我音乐）
         </div>
-        <div v-if="showThreeSearchEntry" class="search-entry search-action" @click="startNormalSearch">
-          ⏱ 点击进行三平台搜索（网易/酷我/酷狗，约 20s）
-        </div>
-        <div v-if="showQQSearchEntry" class="search-entry search-action" @click="startQQSearch">
-          🎵 QQ 音乐单独执行（约 1 分钟），点击开始 QQ 搜索
+        <div v-if="showNeteaseQQSearchEntry" class="search-entry search-action" @click="startNormalSearch">
+          ⏱ 点击进行网易和 QQ 音乐搜索（快速搜索）
         </div>
       </div>
     </div>
@@ -236,7 +233,7 @@ const searchLoading = ref(false)
 const searchRunning = ref(false)
 const currentSearchJobId = ref('')
 const currentSearchMode = ref('')
-const jbSearchDone = ref(false)
+const kuwoSearchDone = ref(false)
 const normalSearchDone = ref(false)
 const searchProgress = ref(0)
 const searchTotalSources = ref(0)
@@ -290,9 +287,8 @@ const mergedSearchRecords = computed(() => {
   return [...local, ...remote]
 })
 
-const showJBSearchEntry = computed(() => hasSearchedLocal.value && !searchRunning.value && !jbSearchDone.value)
-const showThreeSearchEntry = computed(() => hasSearchedLocal.value && jbSearchDone.value && !searchRunning.value && !normalSearchDone.value)
-const showQQSearchEntry = computed(() => hasSearchedLocal.value && normalSearchDone.value && !searchRunning.value)
+const showKuwoSearchEntry = computed(() => hasSearchedLocal.value && !searchRunning.value && !kuwoSearchDone.value)
+const showNeteaseQQSearchEntry = computed(() => hasSearchedLocal.value && kuwoSearchDone.value && !searchRunning.value && !normalSearchDone.value)
 const ringStyle = computed(() => {
   const pct = Math.max(0, Math.min(100, Number(searchProgress.value || 0)))
   return {
@@ -349,12 +345,10 @@ const updateSearchOverflow = () => {
 
 const toCnSource = (source) => {
   const mapping = {
-    JBSouMusicClient: 'JBSou',
     QQMusicClient: 'QQ音乐',
     NeteaseMusicClient: '网易云',
     KuwoMusicClient: '酷我',
     KugouMusicClient: '酷狗',
-    jbsou: 'JBSou',
     qq: 'QQ音乐',
     netease: '网易云',
     kuwo: '酷我',
@@ -554,7 +548,7 @@ const searchLocal = async () => {
   searchTotalSources.value = 0
   searchCompletedSources.value = 0
   searchProgressVisible.value = false
-  jbSearchDone.value = false
+  kuwoSearchDone.value = false
   normalSearchDone.value = false
   currentSearchMode.value = ''
   currentSearchJobId.value = ''
@@ -564,10 +558,10 @@ const searchLocal = async () => {
     const res = await axios.get(`${API_BASE}/music/search/local`, { params: { keyword: kw } })
     localSearchRecords.value = (res.data.records || []).map((x) => ({ ...x, from_library: true }))
     if (localSearchRecords.value.length > 0) {
-      searchMessage.value = `命中歌曲库 ${localSearchRecords.value.length} 条，可继续 JBSou 网络搜索。`
+      searchMessage.value = `命中歌曲库 ${localSearchRecords.value.length} 条，可继续酷我音乐搜索。`
     } else {
-      searchMessage.value = '本地未命中，正在进行 JBSou 网络搜索...'
-      await startNetworkSearch('jb')
+      searchMessage.value = '本地未命中，正在进行酷我音乐搜索...'
+      await startNetworkSearch('kuwo')
     }
   } catch (e) {
     searchMessage.value = '本地搜索失败'
@@ -581,20 +575,20 @@ const startNetworkSearch = async (mode) => {
   if (!kw) return
   await cancelCurrentSearchIfAny()
   searchRunning.value = true
-  if (mode === 'jb') {
-    searchMessage.value = 'JBSou 搜索任务已提交，正在排队/执行...'
+  if (mode === 'kuwo') {
+    searchMessage.value = '酷我音乐搜索任务已提交，正在排队/执行...'
   } else if (mode === 'qq') {
     searchMessage.value = 'QQ 搜索任务已提交，正在排队/执行...'
   } else {
-    searchMessage.value = '三平台搜索任务已提交（约20s），正在排队/执行...'
+    searchMessage.value = '网易和 QQ 音乐搜索任务已提交，正在排队/执行...'
   }
   searchProgress.value = 0
-  searchTotalSources.value = mode === 'normal' ? 3 : 1
+  searchTotalSources.value = mode === 'normal' ? 2 : 1
   searchCompletedSources.value = 0
   searchProgressVisible.value = true
   currentSearchMode.value = mode
-  if (mode === 'jb') {
-    jbSearchDone.value = false
+  if (mode === 'kuwo') {
+    kuwoSearchDone.value = false
     remoteSearchRecords.value = []
   }
   if (mode === 'normal') {
@@ -613,7 +607,7 @@ const startNetworkSearch = async (mode) => {
 }
 
 const startNormalSearch = async () => startNetworkSearch('normal')
-const startJBSearch = async () => startNetworkSearch('jb')
+const startKuwoSearch = async () => startNetworkSearch('kuwo')
 const startQQSearch = async () => startNetworkSearch('qq')
 
 const pollSearchJob = async () => {
@@ -628,9 +622,9 @@ const pollSearchJob = async () => {
     searchCompletedSources.value = Number(data.completed_sources || 0)
     if (data.status === 'done') {
       const mapped = (data.records || []).map((x) => ({ ...x, _job_id: data.job_id, from_library: false }))
-      if (data.mode === 'jb') {
+      if (data.mode === 'kuwo') {
         remoteSearchRecords.value = mapped
-        jbSearchDone.value = true
+        kuwoSearchDone.value = true
       } else if (data.mode === 'normal') {
         remoteSearchRecords.value = mapped
         normalSearchDone.value = true

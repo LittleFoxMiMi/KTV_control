@@ -16,7 +16,7 @@ from typing import List, Dict, Any
 from src.tasks import (
     huey,
     process_song_task,
-    process_music_search_jb_task,
+    process_music_search_kuwo_task,
     process_music_search_normal_task,
     process_music_search_qq_task,
     process_music_download_task,
@@ -147,7 +147,7 @@ class SongRequest(BaseModel):
 
 class MusicSearchStartRequest(BaseModel):
     keyword: str
-    mode: str = 'normal'  # normal | qq
+    mode: str = 'kuwo'  # kuwo | normal | qq
 
 
 class MusicSearchQueueRequest(BaseModel):
@@ -193,7 +193,6 @@ def _song_missing_required_files(song: Dict[str, Any]) -> bool:
 
 def _music_source_to_platform(source: str) -> str:
     mapping = {
-        'JBSouMusicClient': 'jbsou',
         'QQMusicClient': 'qq',
         'NeteaseMusicClient': 'netease',
         'KuwoMusicClient': 'kuwo',
@@ -385,9 +384,9 @@ def music_search_local(keyword: str):
 @app.post('/music/search/start')
 def music_search_start(req: MusicSearchStartRequest):
     keyword = (req.keyword or '').strip()
-    mode = (req.mode or 'normal').strip().lower()
-    if mode not in ('jb', 'normal', 'qq'):
-        raise HTTPException(status_code=400, detail='mode must be jb, normal or qq')
+    mode = (req.mode or 'kuwo').strip().lower()
+    if mode not in ('kuwo', 'normal', 'qq'):
+        raise HTTPException(status_code=400, detail='mode must be kuwo, normal or qq')
     if not keyword:
         raise HTTPException(status_code=400, detail='keyword is required')
 
@@ -407,8 +406,8 @@ def music_search_start(req: MusicSearchStartRequest):
     job_id = str(uuid.uuid4())
     db.create_music_search_job(job_id=job_id, mode=mode, keyword=keyword)
     try:
-        if mode == 'jb':
-            task = process_music_search_jb_task(job_id, keyword)
+        if mode == 'kuwo':
+            task = process_music_search_kuwo_task(job_id, keyword)
         elif mode == 'qq':
             task = process_music_search_qq_task(job_id, keyword)
         else:

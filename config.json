@@ -21,13 +21,5 @@
         "public_hostname": "aquachan.tail83f9dc.ts.net",
         "ssl_certfile": "./cert/aquachan.tail83f9dc.ts.net.crt",
         "ssl_keyfile": "./cert/aquachan.tail83f9dc.ts.net.key"
-    },
-    "music": {
-        "cookie_file_map": {
-            "QQMusicClient": "QQ.txt",
-            "NeteaseMusicClient": "163.txt",
-            "KuwoMusicClient": "kuwo.txt",
-            "KugouMusicClient": ""
-        }
     }
 }

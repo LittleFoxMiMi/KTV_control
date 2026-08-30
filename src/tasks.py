@@ -44,13 +44,6 @@ QUEUE_DOWNLOAD = 'download'
 QUEUE_SEPARATE = 'separate'
 QUEUE_MUSIC_SERIAL = 'music_serial'
 
-DEFAULT_MUSIC_COOKIE_FILE_MAP = {
-    'QQMusicClient': 'QQ.txt',
-    'NeteaseMusicClient': '163.txt',
-    'KuwoMusicClient': '',
-    'KugouMusicClient': '',
-}
-
 ALL_SOURCES_PROGRESS_RE = re.compile(r'ALL\s+sources.*?\((\d+)\s*/\s*(\d+)\)', re.IGNORECASE)
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
@@ -281,27 +274,21 @@ class _ProgressCaptureStream:
         self.buffer = ''
 
 
-def _get_music_cookie_file_map() -> dict:
-    cfg_map = ((config.get('music') or {}).get('cookie_file_map') or DEFAULT_MUSIC_COOKIE_FILE_MAP)
-    return dict(cfg_map)
-
-
-def _search_subprocess_entry(keyword: str, mode: str, cookie_map: dict, result_queue):
+def _search_subprocess_entry(keyword: str, mode: str, result_queue):
     try:
         service = MusicDLService()
         enable_qq = mode == 'qq'
-        if mode == 'jb':
-            sources = ['JBSouMusicClient']
+        if mode == 'kuwo':
+            sources = ['KuwoMusicClient']
         elif enable_qq:
             sources = ['QQMusicClient']
         else:
-            sources = ['NeteaseMusicClient', 'KuwoMusicClient', 'KugouMusicClient']
+            sources = ['NeteaseMusicClient', 'QQMusicClient']
         progress_stream = _ProgressCaptureStream(result_queue)
         with redirect_stdout(progress_stream), redirect_stderr(progress_stream):
             result = service.search_music(
                 keyword=keyword,
                 music_sources=sources,
-                source_cookie_file_map=cookie_map,
                 fast_search=True,
                 enable_qq_separate_search=enable_qq,
                 sort_mode='original_first',
@@ -323,7 +310,6 @@ def _normalize_text(text: str) -> str:
 
 def _normalize_source_name(source: str) -> str:
     mapping = {
-        'JBSouMusicClient': 'JBSou',
         'QQMusicClient': 'QQ',
         'NeteaseMusicClient': '网易',
         'KuwoMusicClient': '酷我',
@@ -350,11 +336,11 @@ def _is_valid_music_record(record: dict, keyword: str) -> bool:
     return True
 
 
-def _run_parallel_source_search(job_id: str, keyword: str, mode: str, cookie_map: dict):
+def _run_parallel_source_search(job_id: str, keyword: str, mode: str):
     result_queue = mp.Queue()
     process = mp.Process(
         target=_search_subprocess_entry,
-        args=(keyword, mode, cookie_map, result_queue),
+        args=(keyword, mode, result_queue),
         daemon=True,
     )
     process.start()
@@ -420,14 +406,13 @@ def _run_parallel_source_search(job_id: str, keyword: str, mode: str, cookie_map
 
 
 def _run_music_search_job(job_id: str, keyword: str, mode: str):
-    if mode == 'jb':
-        sources = ['JBSouMusicClient']
+    if mode == 'kuwo':
+        sources = ['KuwoMusicClient']
     elif mode == 'qq':
         sources = ['QQMusicClient']
     else:
-        sources = ['NeteaseMusicClient', 'KuwoMusicClient', 'KugouMusicClient']
+        sources = ['NeteaseMusicClient', 'QQMusicClient']
 
-    cookie_map = _get_music_cookie_file_map()
     total_sources = len(sources)
     db.update_music_search_job(
         job_id,
@@ -452,7 +437,7 @@ def _run_music_search_job(job_id: str, keyword: str, mode: str):
         message=f"正在并行搜索（{', '.join([_normalize_source_name(x) for x in sources])}）",
     )
 
-    payload = _run_parallel_source_search(job_id, keyword, mode, cookie_map)
+    payload = _run_parallel_source_search(job_id, keyword, mode)
     if payload.get('cancelled'):
         db.update_music_search_job(
             job_id,
@@ -525,7 +510,6 @@ def _run_music_search_job(job_id: str, keyword: str, mode: str):
 
 def _music_source_to_platform(source: str) -> str:
     mapping = {
-        'JBSouMusicClient': 'jbsou',
         'QQMusicClient': 'qq',
         'NeteaseMusicClient': 'netease',
         'KuwoMusicClient': 'kuwo',
@@ -563,6 +547,60 @@ def _song_cancelled(song_id: int) -> bool:
     return db.get_song(song_id) is None
 
 
+def _resolve_music_record_worker(song_record: dict, result_queue) -> None:
+    """Resolve one deferred music row in a process that can be terminated."""
+    try:
+        resolved = MusicDLService().resolve_deferred_music_record(song_record)
+        result_queue.put({'ok': True, 'record': resolved})
+    except Exception as exc:
+        result_queue.put({'ok': False, 'error': str(exc)})
+
+
+def _resolve_music_record_with_cancel(song_id: int, song_record: dict) -> dict:
+    """Resolve a selected row while allowing song deletion to interrupt it."""
+    result_queue = mp.Queue()
+    resolver = mp.Process(target=_resolve_music_record_worker, args=(song_record, result_queue), daemon=True)
+    resolver.start()
+    result = None
+    try:
+        while resolver.is_alive():
+            if _song_cancelled(song_id):
+                resolver.terminate()
+                resolver.join(timeout=1)
+                if resolver.is_alive() and hasattr(resolver, 'kill'):
+                    resolver.kill()
+                    resolver.join(timeout=1)
+                return {'cancelled': True}
+            try:
+                result = result_queue.get(timeout=0.15)
+                break
+            except Empty:
+                continue
+
+        if result is None:
+            try:
+                result = result_queue.get(timeout=0.5)
+            except Empty:
+                result = {'ok': False, 'error': 'music resolution exited without a result'}
+        return result
+    finally:
+        if resolver.is_alive():
+            resolver.terminate()
+        resolver.join(timeout=1)
+        if resolver.is_alive() and hasattr(resolver, 'kill'):
+            resolver.kill()
+            resolver.join(timeout=1)
+        try:
+            resolver.close()
+        except Exception:
+            pass
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+
+
 @huey.task(queue=QUEUE_MUSIC_SERIAL)
 def process_music_download_task(song_id: int, song_record: dict, library_unique_key: str, library_item_id: int = None):
     with _task_lock("music_platform_serial"):
@@ -576,11 +614,30 @@ def process_music_download_task(song_id: int, song_record: dict, library_unique_
                 return
             db.update_status(song_id, 'downloading', 10, status_detail='Downloading Music...')
 
+            if str((song_record or {}).get('download_url') or '').startswith('https://musicsearch.invalid/'):
+                db.update_status(song_id, 'downloading', 12, status_detail='Resolving selected music...')
+                resolution = _resolve_music_record_with_cancel(song_id, song_record)
+                if resolution.get('cancelled'):
+                    return
+                if not resolution.get('ok'):
+                    raise RuntimeError(resolution.get('error') or 'failed to resolve selected music')
+                song_record = resolution['record']
+                if _song_cancelled(song_id):
+                    return
+                resolved_source = str((song_record or {}).get('source') or '')
+                if resolved_source:
+                    # The resolver runs in a child process; recreate the
+                    # source client here so download headers/cookies remain
+                    # available to the parent download session.
+                    music_service._apply_runtime_quality_policy()
+                    music_service.music_client = music_service._create_music_client(
+                        [resolved_source], fast_search=False,
+                    )
+
             save_dir = _make_music_save_dir((song_record or {}).get('source', ''), (song_record or {}).get('song_name', ''), (song_record or {}).get('singers', ''))
             download_result = music_service.download_music_record(
                 song_record=song_record,
                 save_dir=save_dir,
-                cookies_file=None,
                 download_cover=True,
                 download_lyric=True,
                 cancel_check=lambda: _song_cancelled(song_id),
@@ -626,6 +683,7 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
         python_path = config.get('paths', {}).get('python_path', 'python')
         vocal_remover_script = config.get('paths', {}).get('vocal_remover_script', 'src/vocal_remover.py')
         gpu_id = config.get('processing', {}).get('gpu_id', 0)
+        batch_size = config.get('processing', {}).get('batch_size', 4)
         
         is_player_local = db.get_setting('player_on_localhost') == 'true'
         is_playing = any(s.get('status') == 'completed' for s in db.get_all_songs())
@@ -641,6 +699,7 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
             '-i', raw_audio_full_path,
             '-gpu',
             '-id', str(gpu_id),
+            '-b', str(batch_size),
             '--denoise',
             '-o', instrumental_full_path,
         ]
@@ -744,12 +803,6 @@ def separate_music_song_task(song_id: int, download_result: dict, save_dir: str,
         db.update_status(song_id, 'error', 0, error_msg=str(exc), status_detail='Separation Failed')
 
 @huey.task(queue=QUEUE_MUSIC_SERIAL)
-def process_music_search_jb_task(job_id: str, keyword: str):
-    with _task_lock("music_platform_serial"):
-        _run_music_search_job(job_id, keyword, mode='jb')
-
-
-@huey.task(queue=QUEUE_MUSIC_SERIAL)
 def process_music_search_normal_task(job_id: str, keyword: str):
     with _task_lock("music_platform_serial"):
         _run_music_search_job(job_id, keyword, mode='normal')
@@ -759,6 +812,12 @@ def process_music_search_normal_task(job_id: str, keyword: str):
 def process_music_search_qq_task(job_id: str, keyword: str):
     with _task_lock("music_platform_serial"):
         _run_music_search_job(job_id, keyword, mode='qq')
+
+
+@huey.task(queue=QUEUE_MUSIC_SERIAL)
+def process_music_search_kuwo_task(job_id: str, keyword: str):
+    with _task_lock("music_platform_serial"):
+        _run_music_search_job(job_id, keyword, mode='kuwo')
 
 @contextmanager
 def _task_lock(lock_name: str):
@@ -1341,6 +1400,7 @@ def separate_song_task(song_id: int):
             python_path = config['paths'].get('python_path', 'python')
             vocal_remover_script = config['paths'].get('vocal_remover_script', 'src/vocal_remover.py')
             gpu_id = config.get("processing", {}).get("gpu_id", 0)
+            batch_size = config.get("processing", {}).get("batch_size", 4)
             
             is_player_local = db.get_setting('player_on_localhost') == 'true'
             is_playing = any(s.get('status') == 'completed' for s in db.get_all_songs())
@@ -1354,6 +1414,7 @@ def separate_song_task(song_id: int):
                 '-i', full_audio_raw_path,
                 '-gpu',
                 '-id', str(gpu_id),
+                '-b', str(batch_size),
                 '--denoise'
             ]
 
