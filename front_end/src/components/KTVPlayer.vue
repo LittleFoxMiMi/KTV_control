@@ -5,9 +5,10 @@
       class="main-video"
       playsinline
       muted
+      preload="auto"
       controls
       crossorigin
-      :src="videoSrc"
+      :src="bufferedSources[0] || undefined"
     ></video>
 
     <div v-if="needsGesture" class="gesture-overlay" @click="unlockAudio">
@@ -15,10 +16,12 @@
     </div>
     
     <!-- Original Audio Track -->
-    <audio ref="origAudioRef" preload="auto" crossorigin :src="originalAudioSrc"></audio>
+    <audio ref="origAudioRef" preload="auto" crossorigin :src="bufferedSources[1] || undefined"></audio>
     
     <!-- Instrumental Audio Track -->
-    <audio ref="instAudioRef" preload="auto" crossorigin :src="audioSrc"></audio>
+    <audio ref="instAudioRef" preload="auto" crossorigin :src="bufferedSources[2] || undefined"></audio>
+
+    <div class="buffer-status" role="status">{{ bufferStatus }}</div>
 
     <div class="controls-ui" v-if="showControls">
         <div class="control-group">
@@ -70,6 +73,7 @@ import { AudioEngine } from '../audio/AudioEngine.js'
 import { PlaybackController } from '../audio/PlaybackController.js'
 import { TRACK_HARD_SYNC_THRESHOLD, hardAlignTracks, seekMedia } from '../audio/audioSync.js'
 import { API_BASE } from '../network.js'
+import { useSongBuffer } from '../media/useSongBuffer.js'
 
 const props = defineProps({
     videoSrc: String,
@@ -86,6 +90,10 @@ const origAudioRef = ref(null)
 const instAudioRef = ref(null)
 const player = ref(null)
 const needsGesture = ref(false)
+const { sources: bufferedSources, status: bufferStatus, ready: bufferReady } = useSongBuffer(
+    () => [props.videoSrc, props.originalAudioSrc, props.audioSrc]
+)
+let disposed = false
 
 const VIDEO_LOOSE_SYNC_THRESHOLD = /Windows/i.test(navigator.userAgent) ? 0.6 : 0.8
 const PREROLL_VOLUME = 0.001
@@ -414,6 +422,8 @@ const applyTrackMode = () => {
 }
 
 onMounted(async () => {
+    await bufferReady
+    if (disposed) return
     try {
         audioEngine = new AudioEngine(origAudioRef.value, instAudioRef.value)
         await audioEngine.init()
@@ -427,6 +437,7 @@ onMounted(async () => {
     // Delay must be known before autoplay; otherwise the initial zero value
     // briefly starts both audio tracks on every fresh player mount.
     await loadSettings()
+    if (disposed) return
 
     playbackController = new PlaybackController({
         master: videoRef.value,
@@ -456,22 +467,18 @@ onMounted(async () => {
     
     applyTrackMode()
 
-    const onUserGesture = () => {
-        if (needsGesture.value) unlockAudio()
-    }
     window.addEventListener('pointerdown', onUserGesture, { passive: true })
     window.addEventListener('touchstart', onUserGesture, { passive: true })
     window.addEventListener('keydown', onUserGesture)
 
-    onUnmounted(() => {
-        window.removeEventListener('pointerdown', onUserGesture)
-        window.removeEventListener('touchstart', onUserGesture)
-        window.removeEventListener('keydown', onUserGesture)
-    })
 })
 
+const onUserGesture = () => {
+    if (needsGesture.value) unlockAudio()
+}
+
 watch(
-    () => [props.videoSrc, props.audioSrc, props.originalAudioSrc],
+    bufferedSources,
     async () => {
         const token = muteForSourceChange()
         await nextTick()
@@ -482,6 +489,11 @@ watch(
 )
 
 onUnmounted(() => {
+    disposed = true
+    sourceChangeToken++
+    window.removeEventListener('pointerdown', onUserGesture)
+    window.removeEventListener('touchstart', onUserGesture)
+    window.removeEventListener('keydown', onUserGesture)
     playbackController?.dispose()
     playbackController = null
     if (player.value) player.value.destroy()
@@ -537,6 +549,19 @@ defineExpose({
     display: flex;
     flex-direction: column;
     position: relative;
+}
+
+.buffer-status {
+    position: absolute;
+    top: 12px;
+    right: 16px;
+    z-index: 10;
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.45);
+    color: #ddd;
+    font-size: 13px;
+    pointer-events: none;
 }
 
 .track-toast {

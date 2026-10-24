@@ -9,3 +9,4 @@ database/
 cookies/
 cert/
 front_end/dist/
+config.json

@@ -175,11 +175,12 @@ def _media_paths(target_dir: str, video_id: str, video_ext: str, audio_ext: str)
     )
 
 
-def _validate_media_file(file_path: str):
+def _validate_media_file(file_path: str, *, full_decode: bool = False):
     ffmpeg_path = config['paths'].get('ffmpeg_path', 'ffmpeg')
+    decode_args = [] if full_decode else ['-skip_frame', 'nokey']
     result = subprocess.run(
         [ffmpeg_path, '-hide_banner', '-v', 'error', '-xerror',
-         '-err_detect', 'explode', '-skip_frame', 'nokey', '-i', file_path,
+         '-err_detect', 'explode'] + decode_args + ['-i', file_path,
          '-map', '0:v:0', '-an', '-f', 'null', '-'],
         capture_output=True,
         text=True,
@@ -187,6 +188,24 @@ def _validate_media_file(file_path: str):
         errors='replace',
     )
     errors = (result.stderr or '').strip()
+    return result.returncode == 0 and not errors, errors
+
+
+def _remux_video_for_streaming(input_path: str, output_path: str):
+    """Build a regular MP4 with its sample index before the video payload."""
+    ffmpeg_path = config['paths'].get('ffmpeg_path', 'ffmpeg')
+    result = subprocess.run(
+        [ffmpeg_path, '-hide_banner', '-v', 'error', '-xerror', '-y',
+         '-i', input_path, '-map', '0:v:0', '-an', '-c:v', 'copy',
+         '-movflags', '+faststart', output_path],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
+    errors = (result.stderr or '').strip()
+    if result.returncode != 0 and not errors:
+        errors = f"ffmpeg remux exited with code {result.returncode}"
     return result.returncode == 0 and not errors, errors
 
 
@@ -1270,6 +1289,41 @@ def download_song_task(song_id: int):
                             _remove_files_with_prefix(staging_dir, video_prefix)
                             _remove_files_with_prefix(staging_dir, audio_prefix)
                             continue
+
+                        if platform == 'youtube':
+                            remuxed_video = os.path.splitext(downloaded_video)[0] + '.faststart.mp4'
+                            db.update_status(
+                                song_id,
+                                "processing",
+                                100,
+                                status_detail=f"Remuxing video for streaming (attempt {attempt}/{attempt_count})",
+                            )
+                            remux_ok, remux_error = _remux_video_for_streaming(
+                                downloaded_video, remuxed_video
+                            )
+                            if not remux_ok:
+                                last_error = f"Format {format_id} remux failed: {remux_error}"
+                                print(last_error)
+                                _remove_files_with_prefix(staging_dir, video_prefix)
+                                _remove_files_with_prefix(staging_dir, audio_prefix)
+                                continue
+
+                            db.update_status(
+                                song_id,
+                                "processing",
+                                100,
+                                status_detail=f"Validating remuxed video (attempt {attempt}/{attempt_count})",
+                            )
+                            valid_video, validation_error = _validate_media_file(
+                                remuxed_video, full_decode=True
+                            )
+                            if not valid_video:
+                                last_error = f"Format {format_id} remux validation failed: {validation_error}"
+                                print(last_error)
+                                _remove_files_with_prefix(staging_dir, video_prefix)
+                                _remove_files_with_prefix(staging_dir, audio_prefix)
+                                continue
+                            downloaded_video = remuxed_video
 
                         video_ext = os.path.splitext(downloaded_video)[1].lower()
                         audio_ext = os.path.splitext(downloaded_audio[0])[1].lower()
