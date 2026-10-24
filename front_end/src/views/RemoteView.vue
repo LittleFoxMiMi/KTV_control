@@ -200,6 +200,7 @@ import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue'
 import axios from 'axios'
 import Sortable from 'sortablejs'
 import { API_BASE, getWebSocketUrl } from '../network.js'
+import { createRemoteConnection } from '../remoteConnection.js'
 
 const WS_BASE = getWebSocketUrl('/ws/remote')
 
@@ -242,7 +243,6 @@ const searchProgressVisible = ref(false)
 const hasSearchedLocal = ref(false)
 let searchPollTimer = null
 
-let ws = null
 let refreshInterval = null
 let queueSortable = null
 let queueBusy = false
@@ -357,13 +357,14 @@ const toCnSource = (source) => {
   return mapping[source] || source || '-'
 }
 
-const connectWS = () => {
-  ws = new WebSocket(WS_BASE)
-  ws.onopen = () => {
-    isConnected.value = true
+const remoteConnection = createRemoteConnection({
+  url: WS_BASE,
+  onConnectionChange: connected => { isConnected.value = connected },
+  onOpen: () => {
     refreshControlState()
-  }
-  ws.onmessage = (event) => {
+    fetchSongs()
+  },
+  onMessage: (event) => {
     try {
       const cmd = JSON.parse(event.data)
       if (cmd.action === 'setDelay') delay.value = Number(cmd.value)
@@ -380,12 +381,8 @@ const connectWS = () => {
         else if (t === 'volInstMix') volInstMix.value = val
       }
     } catch (e) {}
-  }
-  ws.onclose = () => {
-    isConnected.value = false
-    setTimeout(connectWS, 3000)
-  }
-}
+  },
+})
 
 const saveState = async (key, val) => {
   try {
@@ -394,9 +391,7 @@ const saveState = async (key, val) => {
 }
 
 const sendAction = (action, value = null, target = null) => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ action, value, target }))
-  }
+  remoteConnection.send(JSON.stringify({ action, value, target }))
 }
 
 const setTrack = (mode) => {
@@ -708,11 +703,10 @@ const queueFromSearch = async (item) => {
 }
 
 onMounted(async () => {
-  await refreshControlState()
-
-  await fetchSongs()
+  remoteConnection.start()
+  refreshControlState()
+  fetchSongs()
   refreshInterval = setInterval(fetchSongs, 2000)
-  connectWS()
   window.addEventListener('resize', onResize)
   await nextTick()
   initQueueSorting()
@@ -721,7 +715,7 @@ onMounted(async () => {
 onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval)
   if (queueSortable) queueSortable.destroy()
-  if (ws) ws.close()
+  remoteConnection.stop()
   stopSearchPolling()
   if (noticeTimer) clearTimeout(noticeTimer)
   window.removeEventListener('resize', onResize)
